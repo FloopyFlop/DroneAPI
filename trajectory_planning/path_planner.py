@@ -2,11 +2,9 @@ import sys
 sys.path.insert(1, 'c:/Users/Cameron Mehlman/Documents/Magpie')
 
 import numpy as np
-import pyvista as pv
-from typing import Any, Dict, Type, Optional
+from typing import Any, Dict, Type, Optional, List, Tuple
 import copy
 import time
-import matplotlib.pyplot as plt
 from scipy import interpolate
 
 from trajectory_planning.base_path_planner import basePathPlanner
@@ -18,7 +16,7 @@ class pathPlanner(basePathPlanner):
             self,
             path_planning_algorithm: str, #VFH
             kwargs: Dict[str, Any],
-            goal_state: Optional[list[float]] = None,
+            goal_state: Optional[List[float]] = None,
             max_distance: float = 0.5,
             interpolation_method: str = 'linear',
             avg_speed: float = 0.5,
@@ -38,23 +36,24 @@ class pathPlanner(basePathPlanner):
 
     def set_goal_state(
             self,
-            goal_state: list[float,]
+            goal_state: List[float],
     ) -> None:
         self.goal = goal_state
 
     def update_point_cloud(
             self,
-            point_cloud: list[list[float]]
+            point_cloud: List[List[float]],
+            points_min: int = 1,
     ) -> None:
         if point_cloud is None:
             self.algorithm.reset_map()
         else:
-            self.algorithm.input_points(points=point_cloud)
+            self.algorithm.input_points(points=point_cloud, points_min=points_min)
 
     def check_goal_safety(
             self,
-            goals: list[list[float]],
-            state: list[float] = None,
+            goals: List[List[float]],
+            state: List[float] = None,
     ) -> bool:
         for goal in goals:
             goal = goal[0:3]
@@ -66,9 +65,10 @@ class pathPlanner(basePathPlanner):
 
     def compute_desired_path(
             self,
-            state: list[float],
-            point_cloud: Optional[list[list[float]]] = None,
-    ) -> list[float]:
+            state: List[float],
+            point_cloud: Optional[List[List[float]]] = None,
+            points_min: int = 1,
+    ) -> List[float]:
 
         state_offset = np.zeros((state.size,))
         state_offset[0:3] = state[0:3]
@@ -79,14 +79,14 @@ class pathPlanner(basePathPlanner):
             if np.linalg.norm(next_location) < 0.25*self.algorithm.radius:
                 next_location = [current_state[0:3] - state[0:3], next_location]
             else:
-                next_location = [current_state[0:3] - state[0:3], next_location/np.linalg.norm(next_location)*0.25*self.algorithm.radius]
+                next_location = [current_state[0:3] - state[0:3], next_location/np.linalg.norm(next_location)*0.75*self.algorithm.radius]
         else:
             goal = self.goal-state_offset
             if np.linalg.norm(goal[0:3]) < self.algorithm.get_layer_size():
                 next_location = [current_state - state_offset, goal]
             else:
                 #t0 = time.time()
-                next_location = self.algorithm.compute_next_point(points=point_cloud, goal=goal)
+                next_location = self.algorithm.compute_next_point(points=point_cloud, goal=goal, points_min=points_min)
                 #print(time.time() - t0)
                 
         if self.interpolation_method == 'linear':
@@ -118,8 +118,8 @@ class pathPlanner(basePathPlanner):
     
     def linear_interpolator(
             self,
-            trajectory: list[list[float]],
-    ) -> list[float]:
+            trajectory: List[List[float]],
+    ) -> List[float]:
         
         start = np.array(trajectory[0][0:3])
         end = np.array(trajectory[-1][0:3])
@@ -133,9 +133,10 @@ class pathPlanner(basePathPlanner):
     
     def spline_interpolator(
             self,
-            trajectory: list[list[float]],
+            trajectory: List[List[float]],
             pts: int = 50
-    ) -> list[float]:
+    ) -> List[float]:
+
         k = 2
         if k >= len(trajectory):
             k = len(trajectory)-1

@@ -1,6 +1,6 @@
 import time
 import numpy as np
-from typing import Dict, Any, Type
+from typing import Dict, Any, Type, List, Tuple
 
 from trajectory_planning.polar_histogram_3D import polarHistogram3D
 
@@ -44,9 +44,10 @@ class basePathPlanner():
 
         def input_points(
             self, 
-            points: list[list[float]],
+            points: List[List[float]],
+            points_min: int = 1,
         ) -> None:
-            self.histogram.input_points(points=points)
+            self.histogram.input_points(points=points, points_min=points_min)
 
         def reset_map(self) -> None:
             self.histogram.reset_histogram()
@@ -56,9 +57,10 @@ class basePathPlanner():
 
         def compute_next_point(
                 self,
-                points: list[list[float]],
-                goal: list[float],
-        ) -> list[float]:
+                points: List[List[float]],
+                goal: List[float],
+                points_min: int = 1,
+        ) -> List[float]:
             
             
             off_set = [0,0,0]
@@ -71,7 +73,7 @@ class basePathPlanner():
 
             #t0 = time.time()
             for i in range(self.iterations):
-                self.histogram.input_points(points=np.array(points)-off_set)
+                self.histogram.input_points(points=np.array(points)-off_set, points_min=points_min)
                 #t0 = time.time()
                 for j in range(self.layers):
                     #t0 = time.time()
@@ -106,7 +108,7 @@ class basePathPlanner():
         
         def check_goal_safety(
                 self,
-                goal: list[float],
+                goal: List[float],
         ) -> bool:
             safe = self.histogram.check_point_safety(min_distance=self.min_distance, point=goal)
             return safe

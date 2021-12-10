@@ -1,6 +1,5 @@
 import numpy as np
-from typing import Any, Dict, Optional
-import matplotlib.pyplot as plt
+from typing import Any, Dict, Optional, List, Tuple
 import time
 
 from util.util import gaussian_prob
@@ -33,7 +32,7 @@ class polarHistogram3D():
 
     def convert_cartesian_to_polar(
             self,
-            point: list[float],
+            point: List[float],
     ):
         theta1 = np.arctan2(point[1],point[0]) #angle between +x-axis and point vector
         theta2 = np.arctan2(point[2],point[0]) #angle between xy-plane and point vector (azimuth)
@@ -50,18 +49,23 @@ class polarHistogram3D():
     
     def convert_polar_to_bin(
             self,
-            point: list[float],
-    ) -> tuple[int,int,int]:
+            point: List[float],
+    ) -> Tuple[int,int,int]:
         theta = int(point[0]//self.range)
         phi = int(point[1]//self.range)
         layer = int(point[2]//self.layer_depth)
+
+        if theta == self.sections:
+            theta -= 1
+        if phi == self.sections:
+            phi -= 1
 
         return theta, phi, layer
     
     def convert_cartesian_to_bin(
             self,
-            point: list[float],
-    ) -> tuple[int,int,int]:
+            point: List[float],
+    ) -> Tuple[int,int,int]:
         theta1 = np.arctan2(point[1],point[0]) #angle between +x-axis and point vector
         theta2 = np.arctan2(point[2],point[0]) #angle between xy-plane and point vector (azimuth)
 
@@ -78,23 +82,21 @@ class polarHistogram3D():
         layer = int(dist//self.layer_depth)
 
         return theta, phi, layer
-    
-
 
     def get_reference_point_from_bin(
             self,
-            bin: list[int],
+            bin: List[int],
             layer: int = 0,
-    ) -> list[float]:
+    ) -> List[float]:
 
         return self.refrerence_histogram3D[int(bin[0])][int(bin[1])] * (self.layer_depth * (0.5+layer))
     
     def get_target_point_from_bin(
             self,
-            bin: list[int],
-            goal: list[float],
+            bin: List[int],
+            goal: List[float],
             layer: int = 0,
-    ) -> tuple[list[float], bool]:
+    ) -> Tuple[List[float], bool]:
         '''
         check if goal is inside chosen bin, 
         if goal is inside bin and within range -> return goal
@@ -102,7 +104,7 @@ class polarHistogram3D():
         '''
 
         theta1,theta2,dist = self.convert_cartesian_to_polar(goal)
-        if int(theta1) == int(bin[0]) and int(theta2) == int(bin[1]):
+        if int(theta1//self.range) == int(bin[0]) and int(theta2//self.range) == int(bin[1]):
             if np.linalg.norm(goal) < (self.layer_depth * (0.5+layer)):
                 return goal, True
             else:
@@ -112,8 +114,8 @@ class polarHistogram3D():
     
     def get_bin_from_index(
             self,
-            bin: list[int],
-    ) -> list[float]:
+            bin: List[int],
+    ) -> List[float]:
         
         return self.histogram3D[int(bin[0])][int(bin[1])]
     
@@ -122,7 +124,8 @@ class polarHistogram3D():
 
     def input_points(
             self, 
-            points: list[list[float]],
+            points: List[List[float]],
+            points_min: int = 1,
     ) -> None:
         #t0 = time.time()
         self.points = points
@@ -161,6 +164,8 @@ class polarHistogram3D():
                 for k,layer in enumerate(section2):
                     if layer[6] == 0:
                         continue
+                    elif layer[6] < points_min:
+                        layer[:] = 0
                     else:
                         layer[0:3] /= layer[6]
                         layer[3:6] += np.multiply(-self.histogram_calc_storage[i][j][k]*2,layer[0:3]) + np.multiply(layer[6],np.square(layer[0:3]))
@@ -186,11 +191,11 @@ class polarHistogram3D():
 
     def sort_candidate_bins(
             self,
-            point: list[float],
+            point: List[float],
             layer: int = 0,
-            previous: list[int] = None,
-            previous2: list[int] = None,
-    ) -> list[list[float]]:
+            previous: List[int] = None,
+            previous2: List[int] = None,
+    ) -> List[List[float]]:
 
         sorted_bins = []
         #theta1,theta2,layerp = self.convert_cartesian_to_polar(point)
@@ -222,8 +227,8 @@ class polarHistogram3D():
         
     def check_obstacle_bins(
            self,
-            point: list[float],
-            bin: list[int],
+            point: List[float],
+            bin: List[int],
             distance: float,
             layer: int = 0,
     ) -> bool:
@@ -268,6 +273,12 @@ class polarHistogram3D():
             column_flip = False
             last_pass = False
 
+            #check the center bin first
+            if (self.histogram3D[bin[0]][bin[1]][layer][0:3] != [0,0,0]).any():
+                dist = np.linalg.norm(self.histogram3D[bin[0]][bin[1]][layer][0:3]-point)
+                if dist < distance:
+                    return False
+
             iter = int(np.ceil((self.sections-1)/2))
             for k in range(iter):
                 if last_pass:
@@ -276,8 +287,12 @@ class polarHistogram3D():
                     start = k*2
                     end = k*2 + 2
                 else:
-                    start = k*2
-                    end = k*2 + 1
+                    if self.sections%2 == 1:
+                        start = k*2
+                        end = k*2 + 2
+                    else:
+                        start = k*2
+                        end = k*2 + 1
                 #check columns of square
                 low = min(phi[start],phi[end-1])
                 high = max(phi[start],phi[end-1])
@@ -324,11 +339,11 @@ class polarHistogram3D():
     
     def sort_obstacle_bins(
             self,
-            point: list[float],
-            bin: list[int],
+            point: List[float],
+            bin: List[int],
             distance: float,
             layer: int = 0,
-    ) -> list[list[float]]:
+    ) -> List[List[float]]:
 
         sorted_bins = []
 
@@ -347,13 +362,14 @@ class polarHistogram3D():
     def check_point_safety(
             self,
             min_distance: float,
-            point: list[float],           
+            point: List[float],           
     ) -> bool:
         #t0 = time.time()
+
         theta1,theta2,dist = self.convert_cartesian_to_polar(point)
         b1,b2,l = self.convert_polar_to_bin([theta1,theta2,dist])
         bin = [b1,b2,l]
-        fs = 0.6 #factor of safety, point must be more than 10% closer to min_distance to change route
+        fs = 0.9 #factor of safety, point must be more than 10% closer to min_distance to change route
 
         if dist > self.radius:
             return True
@@ -400,10 +416,10 @@ class polarHistogram3D():
     def confirm_candidate_distance(
             self,
             min_distance: float,
-            bin: list[int],
-            goal: list[float],
+            bin: List[int],
+            goal: List[float],
             layer: int = 0,
-            past_bin: Optional[list[int]] = None,
+            past_bin: Optional[List[int]] = None,
     ) -> bool:
         '''
         Checks all obstacle bins and confirms that no obstacle

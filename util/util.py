@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Union
+from typing import Union, List, Tuple
 
 def euler_from_quaternion(quaternion):
         """
@@ -112,10 +112,10 @@ def triangle_area(v):
       return np.array(areas)
 
 def gaussian_prob(
-            x: list[float],
-            mu: list[float],
-            std: list[float],
-) -> list[float]:
+            x: List[float],
+            mu: List[float],
+            std: List[float],
+) -> List[float]:
       '''
       given an array of means, standard deviations, and values x
       calculate the gaussian probability of values x
@@ -133,9 +133,9 @@ def gaussian_prob(
       return prob
 
 def line_to_point(
-      line: list[float],
-      point: list[float],
-) -> tuple[float, float]:
+      line: List[float],
+      point: List[float],
+) -> Tuple[float, float]:
       '''
       given a line AB (represented as a vector [x,y,z]), and a point (P)
       in cartesian coordinates, returns the shortest distance between

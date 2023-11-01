@@ -1,6 +1,10 @@
+import sys
+sys.path.insert(1, 'c:/Users/Cameron Mehlman/Documents/magpie hardware')
+
 import numpy as np
 import random
 import matplotlib.pyplot as plt
+from pymavlink import mavutil
 from typing import Any, Dict, Type, Optional, Union
 
 from trajectory_planning.path_planner import pathPlanner
@@ -19,10 +23,15 @@ class magpieEnv():
         self.goal = goal
         self.point_cloud_size = point_cloud_size
 
+        self.initial_state = None
         self.global_state = None
         self.global_path_state = None
         self.global_path = None
         self.rel_path = None
+
+        self.connection = None
+
+    
 
     def run(self) -> None:
         '''
@@ -47,6 +56,7 @@ class magpieEnv():
         self.update_state()
         self.path_planner.set_goal_state(goal_state=self.goal)
         self.global_path_state = self.state
+        self.initial_state = self.state
 
     def fill_point_cloud(
             self,
@@ -109,8 +119,39 @@ class magpieEnv():
         '''
         pass
 
-    
-        
+    def initialize_connection(
+            self,
+            port: str = '/dev/ttyTHS1',
+            baud_rate: int = 57600,
+    ) -> None:
+        self.connection = mavutil.mavlink_connection(serial_port, baud=baud_rate)
+
+    def check_connection(
+            self,
+    ) -> bool:
+        heartbeat = mavutil.mavlink.MAVLink_heartbeat_message(6, 8, 192, 0, 4, 0)
+        self.connection.mav.send(heartbeat)
+        print("Sent heartbeat")
+
+        return True
+
+
+if __name__ == "__main__": 
+    mavu = mavutil.mavlink_connection(ser)
+
+    # Define the serial port and baud rate
+    serial_port = '/dev/ttyTHS1' # Jetson Nano's serial port
+    baud_rate = 57600 # Match the TELEM2 port's baud rate
+    # Initialize the serial connection
+    connection = mavutil.mavlink_connection(serial_port, baud=baud_rate)
+    print("done")
+    # Send a heartbeat message
+    heartbeat = mavutil.mavlink.MAVLink_heartbeat_message(6, 8, 192, 0, 4, 0)
+    connection.mav.send(heartbeat)
+    print("Sent heartbeat")
+    # Close the serial connection when done
+    connection.close()
+    print("finished")
 
 
 

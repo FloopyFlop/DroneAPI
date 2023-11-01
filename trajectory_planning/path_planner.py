@@ -16,9 +16,9 @@ class pathPlanner(basePathPlanner):
 
     def __init__(
             self,
-            goal_state: list[float],
             path_planning_algorithm: str, #VFH
             kwargs: Dict[str, Any],
+            goal_state: Optional[list[float]] = None,
             max_distance: float = 0.5,
             interpolation_method: str = 'linear',
             avg_speed: float = 0.5,
@@ -150,8 +150,6 @@ class pathPlanner(basePathPlanner):
             
         return points
 
-
-if __name__ == "__main__":
 
     
 

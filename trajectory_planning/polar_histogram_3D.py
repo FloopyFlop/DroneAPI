@@ -2,26 +2,8 @@ import numpy as np
 from typing import Any, Dict, Optional, List, Tuple
 import time
 
-def gaussian_prob(
-            x: List[float],
-            mu: List[float],
-            std: List[float],
-) -> List[float]:
-      '''
-      given an array of means, standard deviations, and values x
-      calculate the gaussian probability of values x
-      '''
-      prob = prob = np.zeros((len(x),))
-      if np.linalg.norm(std) == 0 and np.linalg.norm(mu-x) > 0:
-            return prob
-      else: 
-            for i in range(len(x)):
-                  if std[i] == 0:
-                        continue
-                  else:
-                        exponent = np.around(-0.5*np.square(np.divide((x[i]-mu[i]),std[i])), decimals=8)
-                        prob[i] = np.divide(1,std[i]*np.sqrt(np.pi*2))*np.exp(exponent)
-      return prob
+from util.util import gaussian_prob
+
 
 class polarHistogram3D():
 

@@ -1,8 +1,6 @@
 import pyrealsense2 as rs
 import numpy as np
 import matplotlib.pyplot as plt
-import time
-import random
 import numpy as np
 from multiprocessing import Process, Value, Array
 from copy import deepcopy

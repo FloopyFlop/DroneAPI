@@ -1,622 +1,219 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from typing import Any, Dict, Optional, Union, List, Tuple
-import copy
-from scipy import interpolate
 import asyncio
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Optional, Tuple, Union
 
+import matplotlib.pyplot as plt
+import numpy as np
 from mavsdk import System
-from mavsdk.offboard import (PositionNedYaw, VelocityNedYaw, OffboardError)
+from mavsdk.offboard import OffboardError, PositionNedYaw, VelocityNedYaw
+from scipy.interpolate import CubicSpline
 
 
-# =========================
-# Utilities
-# =========================
-
-def _to_np(a: Union[List[float], np.ndarray]) -> np.ndarray:
-    return a if isinstance(a, np.ndarray) else np.array(a, dtype=float)
+def _to_np(values: Union[List[float], np.ndarray]) -> np.ndarray:
+    return values if isinstance(values, np.ndarray) else np.array(values, dtype=float)
 
 
-def gaussian_prob(x: np.ndarray, mu: np.ndarray, std: np.ndarray) -> np.ndarray:
+@dataclass
+class Waypoint:
+    x: float
+    y: float
+    z: float
+    yaw: float = 0.0
+    interpolation: Optional[str] = None
+
+
+class PathInterpolator:
     """
-    Vectorized Gaussian PDF per-dimension.
-    Returns per-dimension probabilities (not joint).
+    Generates smooth pose samples (position + yaw) between two points using different
+    interpolation schemes. Results are expressed in the drone's local frame.
     """
-    x = _to_np(x)
-    mu = _to_np(mu)
-    std = _to_np(std)
-    prob = np.zeros_like(x, dtype=float)
 
-    # If std is zero in any dim, that dim contributes 0 unless x==mu there.
-    nz = std != 0
-    if not np.any(nz):
-        return prob
-    z = (x[nz] - mu[nz]) / std[nz]
-    exponent = -0.5 * np.square(z)
-    prob[nz] = (1.0 / (std[nz] * np.sqrt(2.0 * np.pi))) * np.exp(exponent)
-    return prob
+    def __init__(self, dt: float, max_speed: float = 1.0):
+        self.dt = float(dt)
+        self.max_speed = float(max_speed)
+        self._methods = {
+            "linear": self._linear_path,
+            "cubic": self._cubic_path,
+            "minimum_jerk": self._minimum_jerk_path,
+        }
 
+    def available_methods(self) -> List[str]:
+        return list(self._methods.keys())
 
-# =========================
-# VFH in 3D (your original, tidied)
-# =========================
-
-class polarHistogram3D:
-    def __init__(
+    def generate(
         self,
-        radius: float = 1.0,
-        layers: int = 1,
-        angle_sections: int = 36,
-        probability_tolerance: float = 0.05,
-        distance_tolerance: float = 0.2,
-    ):
-        self.points = None
-        self.radius = float(radius)
-        self.layers = int(layers) + 1  # always check 1 layer ahead
-        self.layer_depth = self.radius / self.layers
-        self.probability_tol = float(probability_tolerance)
-        self.distance_tol = float(distance_tolerance)
+        start: np.ndarray,
+        target: np.ndarray,
+        method: str,
+    ) -> List[Dict[str, np.ndarray]]:
+        method = method.lower()
+        if method not in self._methods:
+            raise ValueError(f"Unknown interpolation method '{method}'. Options: {self.available_methods()}.")
 
-        self.sections = int(angle_sections)
-        self.range = 2 * np.pi / self.sections
-        self.histogram3D = np.zeros((self.sections, self.sections, self.layers, 7))
-        self.reference_histogram3D = np.zeros((self.sections, self.sections, 3))
-        self._initialize_reference_histogram3D()
-        self.histogram_calc_storage = None
+        samples = self._methods[method](start=start, target=target)
+        velocities = self._compute_velocities(samples)
 
-    @staticmethod
-    def _cart_to_polar(point: np.ndarray) -> Tuple[float, float, float]:
-        # NOTE: keeping your angle definition for compatibility
-        theta1 = np.arctan2(point[1], point[0])  # angle vs +x in xy
-        theta2 = np.arctan2(point[2], point[0])  # "azimuth" (custom)
-        if theta1 < 0:
-            theta1 += 2 * np.pi
-        if theta2 < 0:
-            theta2 += 2 * np.pi
-        dist = float(np.linalg.norm(point))
-        return theta1, theta2, dist
+        return [
+            {"position": sample.copy(), "velocity": vel.copy()}
+            for sample, vel in zip(samples, velocities)
+        ]
 
-    def convert_polar_to_bin(self, polar: List[float]) -> Tuple[int, int, int]:
-        theta = int(polar[0] // self.range)
-        phi = int(polar[1] // self.range)
-        layer = int(polar[2] // self.layer_depth)
-        if theta == self.sections:
-            theta -= 1
-        if phi == self.sections:
-            phi -= 1
-        return theta, phi, layer
+    def _compute_num_steps(self, start: np.ndarray, target: np.ndarray) -> int:
+        distance = float(np.linalg.norm(target[:3] - start[:3]))
+        duration = max(distance / max(self.max_speed, 1e-3), self.dt)
+        steps = max(int(np.ceil(duration / self.dt)) + 1, 2)
+        return steps
 
-    def convert_cartesian_to_bin(self, point: np.ndarray) -> Tuple[int, int, int]:
-        theta1, theta2, dist = self._cart_to_polar(point)
-        theta = int(theta1 // self.range)
-        phi = int(theta2 // self.range)
-        layer = int(dist // self.layer_depth)
-        return theta, phi, layer
+    def _interp_yaw(self, start_yaw: float, end_yaw: float, steps: int) -> np.ndarray:
+        start_rad = np.deg2rad(start_yaw)
+        end_rad = np.deg2rad(end_yaw)
+        delta = np.arctan2(np.sin(end_rad - start_rad), np.cos(end_rad - start_rad))
+        blend = np.linspace(0.0, 1.0, steps, dtype=float)
+        yaw_rad = start_rad + blend * delta
+        return np.rad2deg(yaw_rad)
 
-    def get_reference_point_from_bin(self, bin_idx: List[int], layer: int = 0) -> np.ndarray:
-        return self.reference_histogram3D[int(bin_idx[0]), int(bin_idx[1])] * (self.layer_depth * (0.5 + layer))
+    def _linear_path(self, start: np.ndarray, target: np.ndarray) -> np.ndarray:
+        steps = self._compute_num_steps(start, target)
+        positions = np.linspace(start[:3], target[:3], steps, axis=0)
+        yaw = self._interp_yaw(start[3], target[3], steps)
+        return np.column_stack((positions, yaw))
 
-    def get_target_point_from_bin(
-        self,
-        bin_idx: List[int],
-        goal: np.ndarray,
-        layer: int = 0,
-    ) -> Tuple[np.ndarray, bool]:
-        theta1, theta2, dist = self._cart_to_polar(goal)
-        if int(theta1 // self.range) == int(bin_idx[0]) and int(theta2 // self.range) == int(bin_idx[1]):
-            if np.linalg.norm(goal) < (self.layer_depth * (0.5 + layer)):
-                return goal, True
-            return goal / np.linalg.norm(goal) * (self.layer_depth * (0.5 + layer)), False
-        return self.reference_histogram3D[int(bin_idx[0]), int(bin_idx[1])] * (self.layer_depth * (0.5 + layer)), False
+    def _cubic_path(self, start: np.ndarray, target: np.ndarray) -> np.ndarray:
+        steps = self._compute_num_steps(start, target)
+        t_samples = np.linspace(0.0, 1.0, steps, dtype=float)
 
-    def reset_histogram(self) -> None:
-        self.histogram3D[:] = 0
-
-    def input_points(self, points: np.ndarray, points_min: int = 1) -> None:
-        self.points = points
-        self.histogram3D[:] = 0
-        self.histogram_calc_storage = np.zeros((self.sections, self.sections, self.layers, 3))
-
-        for point in points:
-            theta1, theta2, dist = self._cart_to_polar(point)
-            if dist > self.radius:
-                continue  # BUGFIX: 'next' -> 'continue'
-            layer = int(dist // self.layer_depth)
-            self.histogram3D[int(theta1 // self.range), int(theta2 // self.range), layer, 0:3] += point
-            self.histogram3D[int(theta1 // self.range), int(theta2 // self.range), layer, 3:6] += np.square(point)
-            self.histogram3D[int(theta1 // self.range), int(theta2 // self.range), layer, 6] += 1
-            self.histogram_calc_storage[int(theta1 // self.range), int(theta2 // self.range), layer] += point
-
-        # finalize mean + std per bin
-        for i in range(self.sections):
-            for j in range(self.sections):
-                for k in range(self.layers):
-                    layer = self.histogram3D[i, j, k]
-                    if layer[6] == 0:
-                        continue
-                    if layer[6] < points_min:
-                        layer[:] = 0
-                        continue
-                    # mean
-                    layer[0:3] /= layer[6]
-                    # std
-                    layer[3:6] += (
-                        -2 * self.histogram_calc_storage[i, j, k] * layer[0:3]
-                        + layer[6] * np.square(layer[0:3])
-                    )
-                    layer[3:6] /= layer[6]
-                    layer[3:6] = np.sqrt(layer[3:6])
-
-    def _initialize_reference_histogram3D(self) -> None:
-        for i in range(self.sections):
-            for j in range(self.sections):
-                theta1 = i * self.range + self.range / 2
-                theta2 = j * self.range + self.range / 2
-                x = np.cos(theta2) * np.cos(theta1)
-                y = np.cos(theta2) * np.sin(theta1)
-                z = np.sin(theta2)
-                self.reference_histogram3D[i, j] = [x, y, z]
-
-    def sort_candidate_bins(
-        self,
-        point: np.ndarray,
-        layer: int = 0,
-        previous: Optional[List[int]] = None,
-        previous2: Optional[List[int]] = None,
-    ) -> np.ndarray:
-        sorted_bins = []
-        for i in range(self.sections):
-            for j in range(self.sections):
-                if (self.histogram3D[i, j, layer, 0:3] == [0, 0, 0]).all():
-                    if previous is None:
-                        angle = np.arccos(
-                            np.clip(
-                                np.dot(point[0:3], self.reference_histogram3D[i, j])
-                                / (np.linalg.norm(point[0:3]) * np.linalg.norm(self.reference_histogram3D[i, j])),
-                                -1, 1,
-                            )
-                        )
-                        cost = angle
-                    else:
-                        prev_pt, _ = self.get_target_point_from_bin(previous, goal=point[0:3], layer=max(0, layer - 1))
-                        cur_pt, _ = self.get_target_point_from_bin([i, j], goal=point[0:3], layer=layer)
-                        angle1 = np.arccos(
-                            np.clip(
-                                np.dot(point[0:3] - prev_pt, cur_pt - prev_pt)
-                                / (np.linalg.norm(point[0:3] - prev_pt) * np.linalg.norm(cur_pt - prev_pt)),
-                                -1, 1,
-                            )
-                        )
-                        cost = angle1
-                        if previous2 is not None and layer >= 2:
-                            prev_pt2, _ = self.get_target_point_from_bin(previous2, goal=point[0:3], layer=layer - 2)
-                            angle2 = np.arccos(
-                                np.clip(
-                                    np.dot(prev_pt - prev_pt2, cur_pt - prev_pt)
-                                    / (np.linalg.norm(prev_pt - prev_pt2) * np.linalg.norm(cur_pt - prev_pt)),
-                                    -1, 1,
-                                )
-                            )
-                            cost += 0.2 * angle2
-                    sorted_bins.append([cost, i, j, layer])
-
-        sorted_bins = np.array(sorted_bins)
-        if sorted_bins.size == 0:
-            return np.array([])
-        return sorted_bins[sorted_bins[:, 0].argsort()]
-
-    def sort_obstacle_bins(
-        self, point: np.ndarray, bin_idx: List[int], distance: float, layer: int = 0
-    ) -> np.ndarray:
-        sorted_bins = []
-        for i in range(self.sections):
-            for j in range(self.sections):
-                if (self.histogram3D[i, j, layer, 0:3] != [0, 0, 0]).any():
-                    dist = np.linalg.norm(self.histogram3D[i, j, layer, 0:3] - point)
-                    sorted_bins.append([dist, i, j, layer])
-        sorted_bins = np.array(sorted_bins)
-        return sorted_bins if sorted_bins.size else np.array([])
-
-    def check_obstacle_bins(self, point: np.ndarray, bin_idx: List[int], distance: float, layer: int = 0) -> bool:
-        """
-        Fast windowed check around the bin to ensure all obstacles are farther than 'distance'
-        """
-        if np.all(self.histogram3D[:, :, layer, :].flatten() == 0):
-            return True
-
-        theta_ord = list(range(self.sections))
-        phi_ord = list(range(self.sections))
-
-        theta_ord.sort(key=lambda x: min(abs(bin_idx[0] - x), abs(bin_idx[0] - (x - self.sections))))
-        phi_ord.sort(key=lambda x: min(abs(bin_idx[1] - x), abs(bin_idx[1] - (x - self.sections))))
-        theta_ord.pop(0)
-        phi_ord.pop(0)
-
-        row_flip = False
-        column_flip = False
-        last_pass = False
-
-        # center first
-        if (self.histogram3D[bin_idx[0], bin_idx[1], layer, 0:3] != [0, 0, 0]).any():
-            dist = np.linalg.norm(self.histogram3D[bin_idx[0], bin_idx[1], layer, 0:3] - point)
-            if dist < distance:
-                return False
-
-        iterations = int(np.ceil((self.sections - 1) / 2))
-        for k in range(iterations):
-            if last_pass:
-                return True
-            if k < iterations - 1:
-                start = k * 2
-                end = k * 2 + 2
-            else:
-                start = k * 2
-                end = k * 2 + (2 if self.sections % 2 == 1 else 1)
-
-            # vertical sweep
-            low = min(phi_ord[start], phi_ord[end - 1])
-            high = max(phi_ord[start], phi_ord[end - 1])
-            if low == high:
-                columns = list(range(0, self.sections))
-            else:
-                if column_flip:
-                    columns = list(range(0, low + 1)) + list(range(high, self.sections))
-                else:
-                    columns = list(range(phi_ord[start], phi_ord[end - 1] + 1))
-                if low == 0 or high == self.sections - 1:
-                    column_flip = True
-
-            for i in theta_ord[start:end]:
-                for j in columns:
-                    if (self.histogram3D[i, j, layer, 0:3] != [0, 0, 0]).any():
-                        dist = np.linalg.norm(self.histogram3D[i, j, layer, 0:3] - point)
-                        if dist < distance:
-                            return False
-                        last_pass = True
-
-            # horizontal sweep
-            low = min(theta_ord[start], theta_ord[end - 1])
-            high = max(theta_ord[start], theta_ord[end - 1])
-            if low == high:
-                rows = list(range(0, self.sections))
-            else:
-                if row_flip:
-                    rows = list(range(0, low)) + list(range(high + 1, self.sections))
-                else:
-                    rows = list(range(low + 1, high))
-                if low == 0 or high == self.sections - 1:
-                    row_flip = True
-
-            for j in phi_ord[start:end]:
-                for i in rows:
-                    if (self.histogram3D[i, j, layer, 0:3] != [0, 0, 0]).any():
-                        dist = np.linalg.norm(self.histogram3D[i, j, layer, 0:3] - point)
-                        if dist < distance:
-                            return False
-                        last_pass = True
-
-        return True
-
-    def check_point_safety(self, min_distance: float, point: np.ndarray) -> bool:
-        theta1, theta2, dist = self._cart_to_polar(point)
-        b1, b2, l = self.convert_polar_to_bin([theta1, theta2, dist])
-
-        if dist > self.radius:
-            return True
-
-        layers = range(self.layers)
-        obstacle_bins = self.sort_obstacle_bins(point=point, bin_idx=[b1, b2, l], distance=min_distance, layer=layers[0])
-        for i in layers[1:]:
-            temp = self.sort_obstacle_bins(point=point, bin_idx=[b1, b2, l], distance=min_distance, layer=i)
-            if temp.size:
-                obstacle_bins = temp if not obstacle_bins.size else np.vstack((obstacle_bins, temp))
-
-        if obstacle_bins.size:
-            obstacle_bins = obstacle_bins[obstacle_bins[:, 0].argsort()]
-
-        fs = 0.9  # safety factor
-        for bad_bin in obstacle_bins:
-            obstacle = self.histogram3D[int(bad_bin[1]), int(bad_bin[2]), int(bad_bin[3]), 0:3]
-            obstacle_std = self.histogram3D[int(bad_bin[1]), int(bad_bin[2]), int(bad_bin[3]), 3:6]
-            p = gaussian_prob(x=point - obstacle, mu=obstacle, std=obstacle_std)
-            zeros = np.where(p == 0)[0]
-            if zeros.size != 0:
-                for zero in zeros:
-                    if abs(point[zero] - obstacle[zero]) > 0:
-                        fprob = 0
-                        break
-            else:
-                fprob = float(np.min(p))
-            if fprob > self.probability_tol or np.linalg.norm(point - obstacle) < min_distance * fs:
-                return False
-        return True
-
-    def confirm_candidate_distance(
-        self,
-        min_distance: float,
-        bin_idx: List[int],
-        goal: np.ndarray,
-        layer: int = 0,
-        past_bin: Optional[List[int]] = None,
-    ) -> bool:
-        center_point, _ = self.get_target_point_from_bin(bin_idx, goal=goal[0:3], layer=layer)
-        theta1, theta2, dist = self._cart_to_polar(center_point)
-
-        layer0 = 0 if dist < min_distance else int((dist - min_distance) // self.layer_depth)
-        layerN = self.layers if (dist + min_distance) > self.radius else int(np.ceil((dist + min_distance) / self.layer_depth))
-
-        b1, b2, l = self.convert_polar_to_bin([theta1, theta2, dist])
-
-        for i in range(layer0, layerN):
-            safe = self.check_obstacle_bins(point=center_point, bin_idx=[b1, b2, l], distance=min_distance, layer=i)
-            if not safe:
-                return False
-        return True
-
-
-class basePathPlanner:
-    def __init__(self, path_planning_algorithm: str, kwargs: Dict[str, Any]):
-        self.algorithm = getattr(self, path_planning_algorithm)(**kwargs)
-
-    class VFH:
-        def __init__(
-            self,
-            radius: float = 1,
-            layers: int = 1,
-            iterations: int = 1,
-            angle_sections: int = 8,
-            min_obstacle_distance: float = 1,
-            probability_tolerance: float = 0.05,
-            distance_tolerance: float = 0.2,
-        ):
-            self.histogram = polarHistogram3D(
-                radius=radius,
-                layers=layers,
-                angle_sections=angle_sections,
-                probability_tolerance=probability_tolerance,
-                distance_tolerance=distance_tolerance,
+        axis_curves = [
+            CubicSpline(
+                [0.0, 1.0],
+                [float(start[i]), float(target[i])],
+                bc_type=((1, 0.0), (1, 0.0)),
             )
-            self.min_distance = float(min_obstacle_distance)
-            self.iterations = int(iterations)
-            self.layers = int(layers)
-            self.radius = float(radius)
+            for i in range(3)
+        ]
+        positions = np.column_stack([curve(t_samples) for curve in axis_curves])
+        yaw = self._interp_yaw(start[3], target[3], steps)
+        return np.column_stack((positions, yaw))
 
-        def input_points(self, points: np.ndarray, points_min: int = 1) -> None:
-            self.histogram.input_points(points=points, points_min=points_min)
+    def _minimum_jerk_path(self, start: np.ndarray, target: np.ndarray) -> np.ndarray:
+        steps = self._compute_num_steps(start, target)
+        blend = np.linspace(0.0, 1.0, steps, dtype=float)
+        blend = 10 * np.power(blend, 3) - 15 * np.power(blend, 4) + 6 * np.power(blend, 5)
+        positions = start[:3][None, :] + (target[:3] - start[:3])[None, :] * blend[:, None]
+        yaw = self._interp_yaw(start[3], target[3], steps)
+        return np.column_stack((positions, yaw))
 
-        def reset_map(self) -> None:
-            self.histogram.reset_histogram()
+    def _compute_velocities(self, samples: np.ndarray) -> np.ndarray:
+        velocities = np.zeros_like(samples, dtype=float)
+        velocities[:-1] = (samples[1:] - samples[:-1]) / self.dt
+        velocities[-1] = velocities[-2]
+        return velocities
 
-        def get_layer_size(self) -> float:
-            return self.histogram.layer_depth
-
-        def compute_next_point(
-            self, points: np.ndarray, goal: np.ndarray, points_min: int = 1
-        ) -> np.ndarray:
-            off_set = np.zeros(3)
-            computed_points = [off_set.copy()]
-            filler = np.zeros(max(0, goal.size - 3))
-
-            past_bin = None
-            past_bin2 = None
-            done = False
-
-            for _ in range(self.iterations):
-                self.histogram.input_points(points=points - off_set, points_min=points_min)
-                for j in range(self.layers):
-                    candidates = self.histogram.sort_candidate_bins(
-                        point=goal - np.concatenate((off_set, filler)),
-                        layer=j,
-                        previous=past_bin,
-                        previous2=past_bin2,
-                    )
-                    for candidate in candidates:
-                        if self.histogram.confirm_candidate_distance(
-                            min_distance=self.min_distance,
-                            bin_idx=[int(candidate[1]), int(candidate[2])],
-                            layer=j,
-                            past_bin=past_bin,
-                            goal=goal - np.concatenate((off_set, filler)),
-                        ):
-                            if self.layers > 1 and j >= 1:
-                                past_bin2 = past_bin
-                            past_bin = [int(candidate[1]), int(candidate[2])]
-                            target, done = self.histogram.get_target_point_from_bin(
-                                bin_idx=[int(candidate[1]), int(candidate[2])], goal=goal[0:3], layer=j
-                            )
-                            computed_points.append(target + off_set)
-                            break
-                    if done:
-                        break
-                if self.iterations > 1:
-                    off_set = computed_points[-1]
-            return np.array(computed_points)
-
-        def check_goal_safety(self, goal: np.ndarray) -> bool:
-            return self.histogram.check_point_safety(min_distance=self.min_distance, point=goal)
-
-
-class pathPlanner(basePathPlanner):
-    def __init__(
-        self,
-        path_planning_algorithm: str,  # "VFH"
-        kwargs: Dict[str, Any],
-        goal_state: Optional[np.ndarray] = None,
-        max_distance: float = 0.5,
-        interpolation_method: str = "linear",
-        avg_speed: float = 0.5,
-        n: int = 50,
-    ):
-        self.goal = _to_np(goal_state) if goal_state is not None else None
-        self.avg_speed = float(avg_speed)
-        self.max_distance = float(max_distance)
-        self.interpolator = getattr(self, interpolation_method + "_interpolator")
-        self.interpolation_method = interpolation_method
-        self.n = int(n)
-
-        super().__init__(path_planning_algorithm=path_planning_algorithm, kwargs=kwargs)
-
-    def set_goal_state(self, goal_state: Union[List[float], np.ndarray]) -> None:
-        self.goal = _to_np(goal_state)
-
-    def update_point_cloud(self, point_cloud: Optional[np.ndarray], points_min: int = 1) -> None:
-        if point_cloud is None:
-            self.algorithm.reset_map()
-        else:
-            self.algorithm.input_points(points=point_cloud, points_min=points_min)
-
-    def check_goal_safety(self, goals: np.ndarray, state: Optional[np.ndarray] = None) -> bool:
-        state = np.zeros(3) if state is None else _to_np(state)
-        for goal in goals:
-            g = _to_np(goal)[0:3]
-            if not self.algorithm.check_goal_safety(g - state):
-                return False
-        return True
-
-    def compute_desired_path(
-        self,
-        state: np.ndarray,
-        point_cloud: Optional[np.ndarray] = None,
-        points_min: int = 1,
-    ) -> np.ndarray:
-        state = _to_np(state)
-        state_offset = np.zeros_like(state)
-        state_offset[0:3] = state[0:3]
-        current_state = state.copy()
-
-        if point_cloud is None:
-            next_location = self.goal[0:3] - state[0:3]
-            if np.linalg.norm(next_location) < 0.25 * self.algorithm.radius:
-                next_location = [current_state[0:3] - state[0:3], next_location]
-            else:
-                next_location = [
-                    current_state[0:3] - state[0:3],
-                    next_location / np.linalg.norm(next_location) * 0.75 * self.algorithm.radius,
-                ]
-        else:
-            goal = self.goal - state_offset
-            if np.linalg.norm(goal[0:3]) < self.algorithm.get_layer_size():
-                next_location = [current_state - state_offset, goal]
-            else:
-                next_location = self.algorithm.compute_next_point(points=point_cloud, goal=goal, points_min=points_min)
-
-        if self.interpolation_method == "linear":
-            path = np.empty((0, len(state)))
-            for i in range(len(next_location)):
-                vel_vector = next_location[i][:] - current_state[0:3]
-                if np.linalg.norm(vel_vector) == 0:
-                    vel_vector = np.zeros(3)
-                else:
-                    vel_vector = vel_vector / np.linalg.norm(vel_vector) * self.avg_speed
-
-                next_state = copy.deepcopy(state_offset)
-                next_state[0:3] += next_location[i][:]
-                next_state[3:6] = vel_vector
-                new_path = self.linear_interpolator([current_state, next_state])
-                path = new_path if i == 0 else np.concatenate((path, new_path), axis=0)
-                current_state = next_state
-        else:
-            path_xyz = self.spline_interpolator(np.array(next_location) + state[0: len(next_location[0])], pts=self.n)
-            if len(path_xyz) == 0:
-                return np.empty((0, len(state)))
-            filler = np.zeros((len(path_xyz), len(state) - 3))
-            path = np.concatenate((np.array(path_xyz), filler), axis=1)
-        return path
-
-    def linear_interpolator(self, trajectory: List[np.ndarray]) -> np.ndarray:
-        start = _to_np(trajectory[0][0:3])
-        end = _to_np(trajectory[-1][0:3])
-        n = int(np.linalg.norm(start - end) // self.max_distance + 1)
-        if n <= 1:
-            return np.array(trajectory)
-        return np.linspace(trajectory[0], trajectory[-1], n)
-
-    def spline_interpolator(self, trajectory: np.ndarray, pts: int = 50) -> List[List[float]]:
-        k = 2
-        if k >= len(trajectory):
-            k = len(trajectory) - 1
-        tck, u = interpolate.splprep([trajectory[:, 0], trajectory[:, 1], trajectory[:, 2]], k=k, s=2)
-        u_fine = np.linspace(0, 1, pts)
-        x, y, z = interpolate.splev(u_fine, tck)
-        return [[float(xi), float(yi), float(zi)] for xi, yi, zi in zip(x, y, z)]
-
-
-# =========================
-# Env layer (NED/XYZ, MAVSDK bindings)
-# =========================
 
 class MagpieEnv:
     """
-    Low-level environment that talks to MAVSDK and exposes simple XYZ <-> NED conversions.
+    Thin wrapper around MAVSDK System that keeps track of the drone's state in a local XYZ frame.
     """
 
-    def __init__(
-        self,
-        planner: pathPlanner,
-        goal: Union[List[float], np.ndarray],
-        points_min: int = 1,
-        wait_time: int = 7,
-        position_tracking: bool = False,
-    ):
-        self.planner = planner
-        self.goal = _to_np(goal)
-        self.points_min = int(points_min)
-        self.wait_time = int(wait_time)
-        self.position_tracking = bool(position_tracking)
-
-        self.point_cloud: Optional[np.ndarray] = None
-        self.mission_running = False
-
-        self.path: Optional[np.ndarray] = None
-        self.lidar = None  # placeholder for sensors
+    def __init__(self, control_rate_hz: float = 10.0):
         self.drone = System()
+        self.control_rate_hz = float(control_rate_hz)
+        self.control_dt = 1.0 / self.control_rate_hz
 
-        self.state = np.zeros(12)
-        self.state_offset = None  # xyz offset from initial NED origin
-        self.time_step = 0
+        self.offset_xyz = np.zeros(3, dtype=float)
+        self.offset_ready = False
 
-    def xyz_to_NED(self, xyz: Union[List[float], np.ndarray]) -> List[float]:
+        self.position_xyz = np.zeros(3, dtype=float)
+        self.velocity_xyz = np.zeros(3, dtype=float)
+
+    @staticmethod
+    def xyz_to_ned(xyz: Union[List[float], np.ndarray]) -> np.ndarray:
         xyz = _to_np(xyz)
-        # x -> east, y -> up, z -> north  (custom mapping retained)
-        NED = [0.0, 0.0, 0.0, 0.0]
-        NED[0] = float(xyz[2])        # north
-        NED[1] = float(xyz[0])        # east
-        NED[2] = float(-xyz[1])       # down
-        return NED
+        ned = np.zeros(3, dtype=float)
+        ned[0] = xyz[2]          # north
+        ned[1] = xyz[0]          # east
+        ned[2] = -xyz[1]         # down
+        return ned
 
-    async def get_position(self) -> List[float]:
-        async for data in self.drone.telemetry.position_velocity_ned():
-            return [data.position.north_m, data.position.east_m, data.position.down_m]
+    @staticmethod
+    def ned_to_xyz(ned: Union[List[float], np.ndarray]) -> np.ndarray:
+        ned = _to_np(ned)
+        xyz = np.zeros(3, dtype=float)
+        xyz[0] = ned[1]
+        xyz[1] = -ned[2]
+        xyz[2] = ned[0]
+        return xyz
+
+    @staticmethod
+    def xyz_to_ned_velocity(vel_xyz_yaw: Union[List[float], np.ndarray]) -> np.ndarray:
+        vel_xyz_yaw = _to_np(vel_xyz_yaw)
+        ned = np.zeros(4, dtype=float)
+        ned[0] = vel_xyz_yaw[2]      # north velocity from z
+        ned[1] = vel_xyz_yaw[0]      # east velocity from x
+        ned[2] = -vel_xyz_yaw[1]     # down velocity from y
+        ned[3] = vel_xyz_yaw[3]      # yaw rate deg/s
+        return ned
+
+    @staticmethod
+    def ned_to_xyz_velocity(vel_ned: Union[List[float], np.ndarray]) -> np.ndarray:
+        vel_ned = _to_np(vel_ned)
+        vel_xyz = np.zeros(3, dtype=float)
+        vel_xyz[0] = vel_ned[1]          # x from east
+        vel_xyz[1] = -vel_ned[2]         # y from -down
+        vel_xyz[2] = vel_ned[0]          # z from north
+        return vel_xyz
+
+    async def get_position_velocity(self) -> Tuple[np.ndarray, np.ndarray]:
+        async for message in self.drone.telemetry.position_velocity_ned():
+            pos = np.array(
+                [message.position.north_m, message.position.east_m, message.position.down_m],
+                dtype=float,
+            )
+            vel = np.array(
+                [message.velocity.north_m_s, message.velocity.east_m_s, message.velocity.down_m_s],
+                dtype=float,
+            )
+            return pos, vel
 
     async def update_state(self) -> None:
-        pos = await self.get_position()
-        # convert to xyz for planner
-        self.state[0] = pos[1]
-        self.state[1] = -pos[2]
-        self.state[2] = pos[0]
+        pos_ned, vel_ned = await self.get_position_velocity()
+        self.position_xyz = self.ned_to_xyz(pos_ned)
+        self.velocity_xyz = self.ned_to_xyz_velocity(vel_ned)
 
     async def compute_offset(self) -> None:
-        pos = await self.get_position()
-        self.state_offset = np.zeros_like(self.state)
-        self.state_offset[0] = pos[1]
-        self.state_offset[1] = -pos[2]
-        self.state_offset[2] = pos[0]
+        await self.update_state()
+        self.offset_xyz = self.position_xyz.copy()
+        self.offset_ready = True
 
-    async def set_new_position(self, NED: List[float], vel: Optional[List[float]] = None) -> None:
-        print('--relative coordinates (xyz):', self.state[0:3] - self.state_offset[0:3])
-        ned_now = await self.get_position()
-        print('--NED now:', ned_now)
-        print("-- Setting new position")
-        if vel is None:
-            await self.drone.offboard.set_position_ned(PositionNedYaw(NED[0], NED[1], NED[2], NED[3]))
-        else:
-            await self.drone.offboard.set_position_velocity_ned(
-                PositionNedYaw(NED[0], NED[1], NED[2], NED[3]),
-                VelocityNedYaw(vel[0], vel[1], vel[2], vel[3])
-            )
+    async def command_position(
+        self,
+        xyz_world: Union[List[float], np.ndarray],
+        yaw_deg: float,
+        velocity_xyz_yaw: Optional[Union[List[float], np.ndarray]] = None,
+    ) -> None:
+        ned_position = self.xyz_to_ned(xyz_world)
+        position_cmd = PositionNedYaw(
+            float(ned_position[0]),
+            float(ned_position[1]),
+            float(ned_position[2]),
+            float(yaw_deg),
+        )
+
+        if velocity_xyz_yaw is None:
+            await self.drone.offboard.set_position_ned(position_cmd)
+            return
+
+        ned_velocity = self.xyz_to_ned_velocity(velocity_xyz_yaw)
+        velocity_cmd = VelocityNedYaw(
+            float(ned_velocity[0]),
+            float(ned_velocity[1]),
+            float(ned_velocity[2]),
+            float(ned_velocity[3]),
+        )
+        await self.drone.offboard.set_position_velocity_ned(position_cmd, velocity_cmd)
 
     async def turn_on_offboard(self) -> None:
-        print("-- Starting offboard")
         try:
             await self.drone.offboard.start()
         except OffboardError as error:
@@ -625,7 +222,6 @@ class MagpieEnv:
             await self.drone.action.disarm()
 
     async def turn_off_offboard(self) -> None:
-        print("-- Stopping offboard")
         try:
             await self.drone.offboard.stop()
         except OffboardError as error:
@@ -640,18 +236,16 @@ class MagpieEnv:
         await self.drone.action.disarm()
 
     async def takeoff_to_altitude(self, altitude: float, yaw: float = 0.0) -> None:
-        """
-        Offboard takeoff: set a position target then start offboard.
-        """
         await self.compute_offset()
-        rel_start_point = np.array([0.0, altitude, 0.0, 0.0])  # xyz,yaw
-        start_point = self.xyz_to_NED(rel_start_point + self.state_offset[0:4])
-        start_point[3] = yaw
+        target_world = self.offset_xyz + np.array([0.0, altitude, 0.0], dtype=float)
 
-        await self.update_state()
-        await self.set_new_position(NED=start_point, vel=[0.0, 0.0, -0.2, 0.0])
-        print('-- taking off')
+        print("-- Taking off")
+        await self.command_position(target_world, yaw_deg=yaw)
+        await asyncio.sleep(0.5)
         await self.turn_on_offboard()
+
+        climb_profile = np.array([0.0, -0.2, 0.0, 0.0], dtype=float)
+        await self.command_position(target_world, yaw_deg=yaw, velocity_xyz_yaw=climb_profile)
         await asyncio.sleep(3.0)
         await self.update_state()
 
@@ -659,77 +253,70 @@ class MagpieEnv:
         print("-- Landing")
         await self.drone.action.land()
 
-    def set_point_cloud(self, cloud_xyz: Optional[np.ndarray]) -> None:
-        self.point_cloud = cloud_xyz
-
-    def plan_path(self) -> None:
-        """
-        Compute and cache a path using current planner, state, and point cloud.
-        """
-        assert self.state_offset is not None, "Call begin_mission() first to compute offsets."
-        path = self.planner.compute_desired_path(
-            state=self.state - self.state_offset,
-            point_cloud=self.point_cloud,
-            points_min=self.planner.algorithm.min_distance if hasattr(self.planner.algorithm, "min_distance") else 1
-        )
-        self.path = path
-
-    def path_is_safe(self) -> bool:
-        return self.planner.check_goal_safety(goals=self.path, state=self.state[0:3]) if self.path is not None else True
-
-
-# =========================
-# Public Facade: DroneAPI
-# =========================
 
 class DroneAPI:
     """
-    Minimal, high-level API you can import and call with just a few functions.
+    Minimal drone control surface with only:
+      * goto()  - fly to a single point using the selected interpolation
+      * follow_waypoints() driven by an easy-to-use queue + dynamic interpolation
+    Optional logging produces a diagnostic plot of position/velocity vs. goals.
     """
 
     def __init__(
         self,
         system_address: str = "udp://:14540",
-        vfh_params: Optional[Dict[str, Any]] = None,
-        interpolation: str = "spline",
-        spline_points: int = 20,
-        goal: Union[List[float], np.ndarray] = (0, 3, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        control_rate_hz: float = 10.0,
+        default_interpolation: str = "minimum_jerk",
+        max_speed_m_s: float = 1.5,
+        use_velocity_command: bool = True,
+        log_enabled: bool = False,
+        log_path: str = "flight_log.png",
+        takeoff_settle_sec: float = 1.5,
+        velocity_ramp_sec: float = 1.0,
     ):
         self.system_address = system_address
+        self.env = MagpieEnv(control_rate_hz=control_rate_hz)
+        self.interpolator = PathInterpolator(dt=self.env.control_dt, max_speed=max_speed_m_s)
+        self.default_interpolation = default_interpolation.lower()
+        self.use_velocity_command = bool(use_velocity_command)
+        self.takeoff_settle_sec = float(takeoff_settle_sec)
+        self.velocity_ramp_sec = float(max(0.0, velocity_ramp_sec))
+        self._update_velocity_ramp_steps()
 
-        vfh_defaults = dict(
-            radius=10.0,
-            iterations=1,
-            layers=8,
-            angle_sections=10,
-            distance_tolerance=0.2,
-            probability_tolerance=0.05,
-            min_obstacle_distance=2.0,
-        )
-        if vfh_params:
-            vfh_defaults.update(vfh_params)
+        self._waypoint_queue: Deque[Waypoint] = deque()
+        self._queue_stop_event: Optional[asyncio.Event] = None
+        self._queue_active = False
 
-        self.planner = pathPlanner(
-            goal_state=_to_np(goal),
-            path_planning_algorithm="VFH",
-            interpolation_method=interpolation,
-            kwargs=vfh_defaults,
-            n=spline_points,
-        )
-        self.env = MagpieEnv(planner=self.planner, goal=_to_np(goal), wait_time=1, position_tracking=False)
+        self._current_yaw = 0.0
+        self._mission_start = 0.0
 
-    # -------- lifecycle
+        self.log_enabled = log_enabled
+        self.log_path = log_path
+        self.telemetry_log: List[Dict[str, np.ndarray]] = []
+        self.goal_history: List[np.ndarray] = []
+
+    def _update_velocity_ramp_steps(self) -> None:
+        if self.velocity_ramp_sec <= 0.0:
+            self._velocity_ramp_steps = 1
+        else:
+            self._velocity_ramp_steps = max(int(self.velocity_ramp_sec / self.env.control_dt), 1)
+
+    def set_max_speed(self, max_speed_m_s: float) -> None:
+        self.interpolator.max_speed = float(max_speed_m_s)
+
+    def set_velocity_ramp(self, ramp_seconds: float) -> None:
+        self.velocity_ramp_sec = float(max(0.0, ramp_seconds))
+        self._update_velocity_ramp_steps()
+
+    # ----- Mission lifecycle -------------------------------------------------
 
     async def begin_mission(self, initial_altitude: float = 2.0, yaw: float = 0.0) -> None:
-        """
-        Connect, wait for healthy estimates, arm, and take off to initial_altitude in offboard.
-        """
         await self.env.drone.connect(system_address=self.system_address)
 
         print("Waiting for connection...")
         async for state in self.env.drone.core.connection_state():
             if state.is_connected:
-                print("-- connection successful")
+                print("-- Connection successful")
                 break
 
         print("Waiting for global position / home position...")
@@ -738,132 +325,302 @@ class DroneAPI:
                 print("-- Global position estimate OK")
                 break
 
-        # Make sure offboard is stopped (safe)
         await self.env.turn_off_offboard()
 
         await self.env.arm()
         await self.env.takeoff_to_altitude(altitude=initial_altitude, yaw=yaw)
+        self._current_yaw = yaw
+        if self.log_enabled:
+            self.start_logging()
+        if self.takeoff_settle_sec > 0.0:
+            await asyncio.sleep(self.takeoff_settle_sec)
+            await self.env.update_state()
 
     async def end_mission(self) -> None:
-        """
-        Land and stop offboard safely.
-        """
         await self.env.simple_land()
-        await asyncio.sleep(10)  # let it land fully
+        await asyncio.sleep(10.0)
         await self.env.turn_off_offboard()
+        if self.log_enabled:
+            self.save_flight_plot()
 
     async def shutdown(self) -> None:
-        """
-        Emergency-safe: ensure offboard off and disarm.
-        """
         await self.env.turn_off_offboard()
         await self.env.disarm()
 
-    # -------- configuration
+    # ----- Queue management --------------------------------------------------
 
-    def set_point_cloud(self, cloud_xyz: Optional[np.ndarray]) -> None:
-        self.env.set_point_cloud(cloud_xyz)
-        self.planner.update_point_cloud(cloud_xyz, points_min=10 if cloud_xyz is not None else 1)
+    def enqueue_waypoint(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        yaw: float = 0.0,
+        interpolation: Optional[str] = None,
+    ) -> None:
+        self._waypoint_queue.append(Waypoint(x, y, z, yaw, interpolation))
 
-    def set_goal(self, goal_xyz12: Union[List[float], np.ndarray]) -> None:
-        self.planner.set_goal_state(_to_np(goal_xyz12))
-        self.env.goal = _to_np(goal_xyz12)
+    def clear_waypoints(self) -> None:
+        self._waypoint_queue.clear()
 
-    def set_vfh_params(self, **kwargs) -> None:
+    async def follow_waypoints(self, wait_for_new: bool = False, idle_sleep: float = 0.25) -> None:
         """
-        Update VFH parameters on the fly (radius, layers, min_obstacle_distance, etc.).
+        Process the waypoint queue until empty. Optionally keep waiting for new waypoints.
         """
-        for k, v in kwargs.items():
-            if hasattr(self.planner.algorithm, k):
-                setattr(self.planner.algorithm, k, v)
+        if self._queue_active:
+            raise RuntimeError("Waypoint queue is already being processed.")
 
-    # -------- movement primitives
+        self._queue_active = True
+        self._queue_stop_event = asyncio.Event()
 
-    async def goto_xyz(self, x: float, y: float, z: float, yaw: float = 0.0, wait_sec: float = 5.0) -> None:
-        """
-        Move to a single xyz coord (meters, local frame) with yaw (deg).
-        """
-        assert self.env.state_offset is not None, "Call begin_mission() first."
+        try:
+            while True:
+                if self._waypoint_queue:
+                    waypoint = self._waypoint_queue.popleft()
+                    await self.goto(
+                        waypoint.x,
+                        waypoint.y,
+                        waypoint.z,
+                        yaw=waypoint.yaw,
+                        interpolation=waypoint.interpolation,
+                        record_goal=True,
+                    )
+                elif wait_for_new and self._queue_stop_event is not None:
+                    if self._queue_stop_event.is_set():
+                        break
+                    await asyncio.sleep(idle_sleep)
+                else:
+                    break
+        finally:
+            self._queue_active = False
+            self._queue_stop_event = None
+
+    def stop_waiting_for_waypoints(self) -> None:
+        if self._queue_stop_event is not None:
+            self._queue_stop_event.set()
+
+    # ----- Movement ---------------------------------------------------------
+
+    async def goto(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        yaw: float = 0.0,
+        interpolation: Optional[str] = None,
+        record_goal: bool = True,
+    ) -> None:
+        if not self.env.offset_ready:
+            raise RuntimeError("Call begin_mission() first to initialize the local frame.")
+
         await self.env.update_state()
-        target_local = np.array([x, y, z, yaw], dtype=float) + self.env.state_offset[0:4]
-        ned = self.env.xyz_to_NED(target_local)
-        ned[3] = yaw
-        await self.env.set_new_position(ned)
-        await asyncio.sleep(wait_sec)
-        await self.env.update_state()
 
-    async def follow_waypoints(self, waypoints: List[Tuple[float, float, float, float]], dwell_sec: float = 3.0) -> None:
-        """
-        Waypoints as list of (x, y, z, yaw). Minimal brains: issues setpoint, waits dwell_sec.
-        """
-        assert self.env.state_offset is not None, "Call begin_mission() first."
-        for (x, y, z, yaw) in waypoints:
-            await self.goto_xyz(x, y, z, yaw=yaw, wait_sec=dwell_sec)
+        current_local = self.env.position_xyz - self.env.offset_xyz
+        start = np.array([current_local[0], current_local[1], current_local[2], self._current_yaw], dtype=float)
+        target = np.array([x, y, z, yaw], dtype=float)
 
-    def plan_path_to(self, x: float, y: float, z: float) -> np.ndarray:
-        """
-        VFH plan from current to goal. Returns path (N x 12 state slots; xyz populated).
-        """
-        assert self.env.state_offset is not None, "Call begin_mission() first."
-        goal = np.zeros_like(self.planner.goal)
-        goal[:3] = [x, y, z]
-        self.set_goal(goal)
-        self.env.plan_path()
-        return self.env.path if self.env.path is not None else np.empty((0, 12))
+        method = (interpolation or self.default_interpolation).lower()
+        samples = self.interpolator.generate(start=start, target=target, method=method)
 
-    async def goto_with_pathfinding(self, x: float, y: float, z: float, yaw: float = 0.0, dwell_sec: float = 1.0) -> None:
-        """
-        Plans a VFH path to (x,y,z) and follows it using offboard set-position setpoints.
-        """
-        path = self.plan_path_to(x, y, z)
-        if path.size == 0:
-            print("-- planner returned empty path; falling back to direct goto")
-            await self.goto_xyz(x, y, z, yaw=yaw, wait_sec=dwell_sec)
-            return
+        if record_goal:
+            self.goal_history.append(target[:3].copy())
 
-        for row in path:
-            # row is 12-long state; first 3 are xyz
-            local = row[0:4] + self.env.state_offset[0:4]
-            ned = self.env.xyz_to_NED(local)
-            ned[3] = yaw
-            await self.env.set_new_position(ned)
-            await asyncio.sleep(dwell_sec)
-            await self.env.update_state()
+        if self.log_enabled:
+            self.telemetry_log.append(
+                self._make_log_sample(target_local=target)
+            )
 
-    async def repeat_path(self, waypoints: List[Tuple[float, float, float, float]], times: int = 2, dwell_sec: float = 2.0) -> None:
-        for _ in range(int(times)):
-            await self.follow_waypoints(waypoints, dwell_sec=dwell_sec)
+        await self._fly_path(samples=samples, target_local=target)
+        self._current_yaw = float(yaw)
+
+    async def _fly_path(self, samples: List[Dict[str, np.ndarray]], target_local: np.ndarray) -> None:
+        # Skip the first sample (current state)
+        for step_idx, sample in enumerate(samples[1:], start=1):
+            pos_local = sample["position"]
+            vel_local = sample["velocity"]
+
+            world_xyz = pos_local[:3] + self.env.offset_xyz
+            yaw_deg = float(pos_local[3])
+
+            velocity_xyz_yaw = None
+            if self.use_velocity_command:
+                ramp_scale = min(step_idx / float(self._velocity_ramp_steps), 1.0)
+                velocity_xyz_yaw = np.array(
+                    [
+                        vel_local[0] * ramp_scale,
+                        vel_local[1] * ramp_scale,
+                        vel_local[2] * ramp_scale,
+                        vel_local[3] * ramp_scale,
+                    ],
+                    dtype=float,
+                )
+
+            await self.env.command_position(world_xyz, yaw_deg=yaw_deg, velocity_xyz_yaw=velocity_xyz_yaw)
+            await asyncio.sleep(self.env.control_dt)
+
+            if self.log_enabled:
+                await self.env.update_state()
+                self.telemetry_log.append(self._make_log_sample(target_local=target_local))
+
+    # ----- Logging ----------------------------------------------------------
+
+    def _make_log_sample(self, target_local: np.ndarray) -> Dict[str, np.ndarray]:
+        time_stamp = time.time() - self._mission_start
+        position_local = (self.env.position_xyz - self.env.offset_xyz).copy()
+        velocity_local = self.env.velocity_xyz.copy()
+        distance_to_goal = np.linalg.norm(position_local - target_local[:3])
+        return {
+            "time": np.array(time_stamp, dtype=float),
+            "position": position_local,
+            "velocity": velocity_local,
+            "goal": target_local[:3].copy(),
+            "distance_to_goal": np.array(distance_to_goal, dtype=float),
+        }
+
+    def start_logging(self) -> None:
+        self.telemetry_log.clear()
+        self.goal_history.clear()
+        self._mission_start = time.time()
+
+    def end_logging(self) -> None:
+        self.telemetry_log.clear()
+        self.goal_history.clear()
+        self._mission_start = 0.0
+
+    def save_flight_plot(self, path: Optional[str] = None) -> Optional[str]:
+        if not self.log_enabled or len(self.telemetry_log) < 2:
+            self.end_logging()
+            return None
+
+        path = path or self.log_path
+
+        times = np.array([sample["time"] for sample in self.telemetry_log], dtype=float)
+        positions = np.stack([sample["position"] for sample in self.telemetry_log])
+        goals = np.stack([sample["goal"] for sample in self.telemetry_log])
+        velocities = np.stack([sample["velocity"] for sample in self.telemetry_log])
+        distances = np.array([sample["distance_to_goal"] for sample in self.telemetry_log], dtype=float)
+
+        speed = np.linalg.norm(velocities, axis=1)
+
+        goal_change_indices = [0]
+        for i in range(1, len(goals)):
+            if not np.allclose(goals[i], goals[i - 1]):
+                goal_change_indices.append(i)
+        goal_change_times = times[goal_change_indices]
+
+        fig = plt.figure(figsize=(12, 14))
+        gs = fig.add_gridspec(4, 2, height_ratios=[1.2, 1.0, 1.0, 0.9], hspace=0.35, wspace=0.25)
+
+        ax_path = fig.add_subplot(gs[0, :])
+        ax_path.plot(positions[:, 0], positions[:, 2], label="trajectory", color="C0")
+        unique_goals = goals[goal_change_indices]
+        ax_path.scatter(unique_goals[:, 0], unique_goals[:, 2], color="C1", marker="x", s=60, label="goals")
+        ax_path.set_xlabel("x (m)")
+        ax_path.set_ylabel("z (m)")
+        ax_path.set_title("Top-down path (x vs z)")
+        ax_path.grid(True, linestyle=":")
+        ax_path.axis("equal")
+        ax_path.legend(loc="best")
+
+        ax_pos_x = fig.add_subplot(gs[1, 0])
+        ax_pos_x.plot(times, positions[:, 0], label="x actual", color="C0")
+        ax_pos_x.plot(times, goals[:, 0], "--", label="x target", color="C1")
+        for t in goal_change_times:
+            ax_pos_x.axvline(t, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
+        ax_pos_x.set_ylabel("x (m)")
+        ax_pos_x.grid(True, linestyle=":")
+        ax_pos_x.legend(loc="upper right")
+
+        ax_pos_z = fig.add_subplot(gs[1, 1])
+        ax_pos_z.plot(times, positions[:, 2], label="z actual", color="C0")
+        ax_pos_z.plot(times, goals[:, 2], "--", label="z target", color="C1")
+        for t in goal_change_times:
+            ax_pos_z.axvline(t, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
+        ax_pos_z.set_ylabel("z (m)")
+        ax_pos_z.grid(True, linestyle=":")
+        ax_pos_z.legend(loc="upper right")
+
+        ax_alt = fig.add_subplot(gs[2, 0])
+        ax_alt.plot(times, positions[:, 1], label="y actual", color="C0")
+        ax_alt.plot(times, goals[:, 1], "--", label="y target", color="C1")
+        for t in goal_change_times:
+            ax_alt.axvline(t, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
+        ax_alt.set_ylabel("y (m)")
+        ax_alt.set_xlabel("time (s)")
+        ax_alt.grid(True, linestyle=":")
+        ax_alt.legend(loc="upper right")
+
+        ax_vel = fig.add_subplot(gs[2, 1])
+        ax_vel.plot(times, velocities[:, 0], label="vx", color="C0")
+        ax_vel.plot(times, velocities[:, 1], label="vy", color="C1")
+        ax_vel.plot(times, velocities[:, 2], label="vz", color="C2")
+        ax_vel.plot(times, speed, label="speed", color="C3", linewidth=1.5)
+        ax_vel.set_ylabel("velocity (m/s)")
+        ax_vel.set_xlabel("time (s)")
+        ax_vel.grid(True, linestyle=":")
+        ax_vel.legend(loc="upper right")
+
+        ax_dist = fig.add_subplot(gs[3, :])
+        ax_dist.plot(times, distances, color="C4")
+        for t in goal_change_times:
+            ax_dist.axvline(t, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
+        ax_dist.set_ylabel("distance to goal (m)")
+        ax_dist.set_xlabel("time (s)")
+        ax_dist.grid(True, linestyle=":")
+        ax_dist.set_title("Distance to active goal")
+
+        fig.tight_layout()
+        plt.savefig(path, dpi=200)
+        plt.close(fig)
+        self.end_logging()
+
+        print(f"-- Saved flight log plot to {path}")
+        return path
 
 
-# =========================
-# Demo main
-# =========================
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+
 
 async def _demo():
-    """
-    Quick demo:
-      - connect & takeoff to 3m
-      - fly a couple waypoints
-      - pathfind to (0,3,30)
-      - land & shutdown
-    """
-    drone = DroneAPI(system_address="udp://:14540")
+    tests = [
+        ("linear", "demo_linear_flight.png"),
+        ("cubic", "demo_cubic_flight.png"),
+        ("minimum_jerk", "demo_minimum_jerk_flight.png"),
+    ]
 
-    # optional: load a synthetic point cloud for planning (commented)
-    # cloud = np.random.uniform(low=[-5, 0.5, -5], high=[5, 5, 5], size=(1000, 3))
-    # drone.set_point_cloud(cloud)
+    rng = np.random.default_rng(seed=42)
+    initial_altitude = 3.0
 
-    await drone.begin_mission(initial_altitude=3.0, yaw=0.0)
+    for method, output_file in tests:
+        print(f"\n=== Running {method} interpolation test ===")
+        drone = DroneAPI(
+            system_address="udp://:14540",
+            default_interpolation=method,
+            log_enabled=True,
+            log_path=output_file,
+        )
 
-    # simple moves
-    await drone.goto_xyz(0, 3, 5, yaw=0)
-    await drone.follow_waypoints([(0, 3, 7, 0), (1, 3, 7, 20), (1, 3, 9, 0)], dwell_sec=2.0)
+        await drone.begin_mission(initial_altitude=initial_altitude, yaw=0.0)
 
-    # plan & execute VFH path to a distant goal
-    await drone.goto_with_pathfinding(0, 3, 30, yaw=0, dwell_sec=0.8)
+        # Generate a random waypoint track (x, y, z) within a reasonable cube around the origin.
+        num_waypoints = int(rng.integers(4, 7))
+        random_track = rng.uniform(low=[-2.0, 2.0, -2.0], high=[2.0, 5.0, 2.0], size=(num_waypoints, 3))
+        yaw_samples = rng.uniform(low=-35.0, high=35.0, size=num_waypoints)
 
-    await drone.end_mission()
-    await drone.shutdown()
+        for idx in range(num_waypoints):
+            x, y, z = random_track[idx]
+            yaw = yaw_samples[idx]
+            drone.enqueue_waypoint(float(x), float(y), float(z), yaw=float(yaw), interpolation=method)
+
+        await drone.follow_waypoints()
+
+        # Return to the origin before landing so we touch down at (0,0).
+        await drone.goto(0.0, initial_altitude, 0.0, yaw=0.0, interpolation=method)
+        await drone.goto(0.0, 0.5, 0.0, yaw=0.0, interpolation=method)
+
+        await drone.end_mission()
+        await drone.shutdown()
 
 
 def main():
@@ -871,5 +628,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # matplotlib is only used in your original demo for plotting; not needed for core API.
     main()

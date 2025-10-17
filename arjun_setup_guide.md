@@ -1,5 +1,5 @@
 Run Instructions For Drone Sim:
-PX4 - `cd ~/Documents/PX4-Autopilot/ && make px4_sitl gz_x500`
+PX4 - `cd ~/Documents/PX4-Autopilot/ && make px4_sitl gz_x500` OR NO GUI `cd ~/Documents/PX4-Autopilot/ && HEADLESS=1 make px4_sitl gz_x500`
 MavProxy - `cd ~/Documents/MAVProxy/ && mavproxy.py --master=udp:127.0.0.1:14550`
 Both - `( cd ~/Documents/MAVProxy && mavproxy.py --master=udp:127.0.0.1:14550 >/dev/null 2>&1 ) & BG=$!; trap 'kill "$BG" 2>/dev/null' INT TERM EXIT; cd ~/Documents/PX4-Autopilot && make px4_sitl gz_x500`
 

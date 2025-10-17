@@ -11,6 +11,9 @@ from mavsdk.offboard import OffboardError, PositionNedYaw, VelocityNedYaw
 from scipy.interpolate import CubicSpline
 
 
+PRECISION_METHOD = "precision"
+
+
 def _to_np(values: Union[List[float], np.ndarray]) -> np.ndarray:
     return values if isinstance(values, np.ndarray) else np.array(values, dtype=float)
 
@@ -273,6 +276,8 @@ class DroneAPI:
         log_path: str = "flight_log.png",
         takeoff_settle_sec: float = 1.5,
         velocity_ramp_sec: float = 1.0,
+        precision_tolerance: float = 0.1,
+        precision_timeout_sec: float = 20.0,
     ):
         self.system_address = system_address
         self.env = MagpieEnv(control_rate_hz=control_rate_hz)
@@ -282,6 +287,9 @@ class DroneAPI:
         self.takeoff_settle_sec = float(takeoff_settle_sec)
         self.velocity_ramp_sec = float(max(0.0, velocity_ramp_sec))
         self._update_velocity_ramp_steps()
+        self.precision_method = PRECISION_METHOD
+        self.precision_tolerance = float(max(precision_tolerance, 0.0))
+        self.precision_timeout_sec = float(max(precision_timeout_sec, self.env.control_dt))
 
         self._waypoint_queue: Deque[Waypoint] = deque()
         self._queue_stop_event: Optional[asyncio.Event] = None
@@ -307,6 +315,12 @@ class DroneAPI:
     def set_velocity_ramp(self, ramp_seconds: float) -> None:
         self.velocity_ramp_sec = float(max(0.0, ramp_seconds))
         self._update_velocity_ramp_steps()
+
+    def available_interpolations(self) -> List[str]:
+        methods = list(self.interpolator.available_methods())
+        if self.precision_method not in methods:
+            methods.append(self.precision_method)
+        return methods
 
     # ----- Mission lifecycle -------------------------------------------------
 
@@ -419,7 +433,10 @@ class DroneAPI:
         target = np.array([x, y, z, yaw], dtype=float)
 
         method = (interpolation or self.default_interpolation).lower()
-        samples = self.interpolator.generate(start=start, target=target, method=method)
+        samples: Optional[List[Dict[str, np.ndarray]]] = None
+
+        if method != self.precision_method:
+            samples = self.interpolator.generate(start=start, target=target, method=method)
 
         if record_goal:
             self.goal_history.append(target[:3].copy())
@@ -429,7 +446,11 @@ class DroneAPI:
                 self._make_log_sample(target_local=target)
             )
 
-        await self._fly_path(samples=samples, target_local=target)
+        if method == self.precision_method:
+            await self._fly_precise(target_local=target)
+        else:
+            assert samples is not None
+            await self._fly_path(samples=samples, target_local=target)
         self._current_yaw = float(yaw)
 
     async def _fly_path(self, samples: List[Dict[str, np.ndarray]], target_local: np.ndarray) -> None:
@@ -460,6 +481,60 @@ class DroneAPI:
             if self.log_enabled:
                 await self.env.update_state()
                 self.telemetry_log.append(self._make_log_sample(target_local=target_local))
+
+    async def _fly_precise(self, target_local: np.ndarray) -> None:
+        max_step_distance = max(self.interpolator.max_speed * self.env.control_dt, 1e-3)
+        max_iterations = max(int(self.precision_timeout_sec / self.env.control_dt), 1)
+        yaw_deg = float(target_local[3])
+
+        for _ in range(max_iterations):
+            await self.env.update_state()
+            position_local = self.env.position_xyz - self.env.offset_xyz
+            error_vec = target_local[:3] - position_local
+            distance = float(np.linalg.norm(error_vec))
+
+            if self.log_enabled:
+                self.telemetry_log.append(self._make_log_sample(target_local=target_local))
+
+            if distance <= self.precision_tolerance:
+                break
+
+            if distance > 1e-6:
+                direction = error_vec / distance
+            else:
+                direction = np.zeros(3, dtype=float)
+
+            step_distance = min(distance, max_step_distance)
+            next_local = position_local + direction * step_distance
+            world_xyz = next_local + self.env.offset_xyz
+
+            velocity_xyz_yaw = None
+            if self.use_velocity_command and distance > 1e-6:
+                commanded_speed = min(self.interpolator.max_speed, distance / self.env.control_dt)
+                velocity_xyz_yaw = np.array(
+                    [
+                        direction[0] * commanded_speed,
+                        direction[1] * commanded_speed,
+                        direction[2] * commanded_speed,
+                        0.0,
+                    ],
+                    dtype=float,
+                )
+
+            await self.env.command_position(world_xyz, yaw_deg=yaw_deg, velocity_xyz_yaw=velocity_xyz_yaw)
+            await asyncio.sleep(self.env.control_dt)
+        else:
+            print(
+                f"-- Precision interpolation timed out before reaching tolerance "
+                f"{self.precision_tolerance:.2f} m"
+            )
+
+        target_world = target_local[:3] + self.env.offset_xyz
+        await self.env.command_position(target_world, yaw_deg=yaw_deg)
+        await asyncio.sleep(self.env.control_dt)
+        if self.log_enabled:
+            await self.env.update_state()
+            self.telemetry_log.append(self._make_log_sample(target_local=target_local))
 
     # ----- Logging ----------------------------------------------------------
 
@@ -587,6 +662,7 @@ async def _demo():
         ("linear", "demo_linear_flight.png"),
         ("cubic", "demo_cubic_flight.png"),
         ("minimum_jerk", "demo_minimum_jerk_flight.png"),
+        (PRECISION_METHOD, "demo_precision_flight.png"),
     ]
 
     rng = np.random.default_rng(seed=42)
@@ -617,7 +693,7 @@ async def _demo():
 
         # Return to the origin before landing so we touch down at (0,0).
         await drone.goto(0.0, initial_altitude, 0.0, yaw=0.0, interpolation=method)
-        await drone.goto(0.0, 0.5, 0.0, yaw=0.0, interpolation=method)
+        await drone.goto(0.0, 0.0, 0.0, yaw=0.0, interpolation=method)
 
         await drone.end_mission()
         await drone.shutdown()

@@ -1,56 +1,82 @@
-# Drone API Overview
+# DroneAPI Reference
 
-This module bundles point-cloud planning, MAVSDK bindings, and a thin facade for flying a vehicle with Velocity Field Histogram (VFH) avoidance. Use it when you want a minimal path-planning+execution loop without wiring up the planner and environment by hand.
+`DroneAPI` wraps MAVSDK offboard control with a tiny movement queue, multiple interpolation profiles, and optional telemetry logging. Everything lives in `drone_env_modular.py`.
 
-## Quick Start
-- Instantiate `DroneAPI(system_address="udp://:14540")`.
-- `await begin_mission()` to arm and climb to a safe altitude.
-- (Optional) `set_point_cloud(cloud)` with a numpy `(N, 3)` obstacle cloud to seed the planner.
-- Drive the vehicle with `goto_xyz`, `follow_waypoints`, or `goto_with_pathfinding`.
-- `await end_mission()` followed by `await shutdown()` to land and disarm safely.
-
+## Quick Example
 ```python
 import asyncio
-import numpy as np
 from drone_env_modular import DroneAPI
 
-async def fly_square():
-    api = DroneAPI()
-    await api.begin_mission(initial_altitude=3.0)
-    api.set_point_cloud(np.random.uniform(-5, 5, size=(500, 3)))
-    await api.goto_with_pathfinding(0, 5, 5)
-    await api.end_mission()
-    await api.shutdown()
+async def mission():
+    drone = DroneAPI(system_address="udp://:14540", log_enabled=True)
+    await drone.begin_mission(initial_altitude=3.0, yaw=0.0)
 
-asyncio.run(fly_square())
+    drone.enqueue_waypoint(1.0, 3.0, 4.0, yaw=10.0)
+    drone.enqueue_waypoint(0.0, 4.0, 2.0, yaw=0.0, interpolation="precision")
+    await drone.follow_waypoints()
+
+    await drone.goto(0.0, 3.0, 0.0)
+    await drone.end_mission()
+    # Logging automatically saves when end_mission finishes.
+
+asyncio.run(mission())
 ```
 
-## Facade: `DroneAPI`
-- **Lifecycle**: `begin_mission`, `end_mission`, and `shutdown` wrap MAVSDK connection, arming, takeoff, landing, and offboard management.
-- **Planning settings**: `set_goal`, `set_point_cloud`, and `set_vfh_params` feed new goals or obstacle data to the underlying planner.
-- **Motion commands**:
-  - `goto_xyz(x, y, z, yaw=0)` issues a single offboard position setpoint.
-  - `follow_waypoints([(x, y, z, yaw), ...])` reuses `goto_xyz` with dwell times.
-  - `plan_path_to(x, y, z)` returns an `N x 12` state array (xyz populated) computed with VFH.
-  - `goto_with_pathfinding(x, y, z, yaw=0)` plans first, then iterates through the path.
-  - `repeat_path(waypoints, times=2)` loops over a set of waypoints.
+## Lifecycle
+- `await begin_mission(initial_altitude=2.0, yaw=0.0)`  
+  Connects to the vehicle, waits for healthy telemetry, arms, climbs to the requested altitude, and (when `log_enabled=True`) starts a fresh logging session.
+- `await end_mission()`  
+  Commands a land, waits for touchdown, turns off offboard, and auto-saves the current flight plot if logging is active.
+- `await shutdown()`  
+  Emergency-safe cleanup: ensures offboard is stopped and the vehicle is disarmed.
 
-All drone-facing methods assume `begin_mission()` has run: this call computes `state_offset`, starts offboard mode, and guarantees telemetry is healthy.
+## Movement & Queue
+- `await goto(x, y, z, yaw=0.0, interpolation=None)`  
+  Sends the drone to a single XYZ target (local frame) using the selected interpolation. Passing `interpolation=None` uses the `default_interpolation` from the constructor.
+- `enqueue_waypoint(x, y, z, yaw=0.0, interpolation=None)` / `clear_waypoints()`  
+  Push or reset the queued track. Each waypoint may override the interpolation mode.
+- `await follow_waypoints(wait_for_new=False, idle_sleep=0.25)`  
+  Consumes the queue in order. Set `wait_for_new=True` to keep the worker alive until `stop_waiting_for_waypoints()` is called.
+- `stop_waiting_for_waypoints()`  
+  Signals a waiting worker to finish when `wait_for_new=True`.
+- `available_interpolations()`  
+  Returns the list of supported interpolation keywords.
 
-## Environment Layer: `MagpieEnv`
-- Owns the MAVSDK `System` instance and handles async helpers (`arm`, `disarm`, `turn_on_offboard`, etc.).
-- Maintains the current 12-element state vector, converts between the module's XYZ frame and MAVSDK NED via `xyz_to_NED`, and caches the latest planned path.
-- `plan_path()` delegates to the planner, stores the result on `self.path`, and `path_is_safe()` re-checks candidate goals against VFH collision tests.
+All movement commands require that `begin_mission()` has already been awaited so the local reference frame is known.
 
-## Planner Stack
-- **`pathPlanner`**: wraps concrete planners (currently only `VFH`). It tracks the active goal, interpolation style (`linear` or `spline`), and desired average speed. `compute_desired_path(state, point_cloud)` returns a numpy array of 12-element states ready for offboard dispatch.
-- **`basePathPlanner.VFH`**: converts point clouds into a layered polar histogram (`polarHistogram3D`) and selects collision-free bins near the goal. Tunable parameters include `radius`, `layers`, `min_obstacle_distance`, and `angle_sections`.
-- **`polarHistogram3D`** (internal): bins obstacle points, tracks per-bin Gaussian statistics, and runs safety checks (`check_point_safety`, `confirm_candidate_distance`) during planning iterations.
+## Interpolation Modes
+- `linear` – straight-line position samples with constant-speed velocity targets.
+- `cubic` – clamped cubic splines (zero velocity at endpoints) for smooth arrivals.
+- `minimum_jerk` – quintic easing curve for gradual acceleration and deceleration.
+- `precision` – step toward the goal in a straight line, ignoring future waypoints. The drone keeps inching forward until it is within `precision_tolerance` meters of the target. Useful when you need accurate stops more than path smoothness.
 
-## Parameter Tweaks
-- Increase `radius` and `layers` for look-ahead distance at the cost of compute time.
-- `min_obstacle_distance` acts as the clearance radius; increasing it yields wider margins.
-- Switch `interpolation="linear"` if you prefer straight segments over splined paths; adjust `spline_points` to control sampling density.
+Change the default with `default_interpolation` in the constructor or per-call via the `interpolation` argument.
 
-## Concurrency Notes
-All public methods that touch the drone (`begin_mission`, `goto_xyz`, `goto_with_pathfinding`, etc.) are `async` and must run inside an asyncio event loop. Planner configuration (`set_goal`, `set_vfh_params`, `set_point_cloud`) is synchronous.
+### Precision Parameters
+The constructor exposes two tuning knobs:
+- `precision_tolerance` (meters, default `0.1`) – distance required before the next waypoint is released.
+- `precision_timeout_sec` (default `20.0`) – safety cap on how long the precision controller will try before emitting a warning and moving on.
+
+## Logging & Flight Plots
+- Pass `log_enabled=True` (and optionally `log_path="flight_log.png"`) to record telemetry.
+- Logging starts automatically inside `begin_mission()`; you can also call `start_logging()` manually for ad-hoc sessions.
+- After a mission, call `save_flight_plot(path=None)` to emit a diagnostic PNG with:
+  - top-down x–z path with goal markers,
+  - x/z/y vs. time traces,
+  - velocity components and total speed,
+  - distance-to-active-goal vs. time.
+  The routine clears the buffered log (`end_logging()`) so the next session begins clean.
+
+## Configuration Helpers
+- `set_max_speed(value)` – updates the maximum interpolation speed (affects all modes).
+- `set_velocity_ramp(seconds)` – adjusts the soft-start ramp that scales the initial velocity commands.
+- `set_velocity_command` (constructor flag) – disable velocity setpoints to issue position-only commands if your vehicle prefers it.
+
+## Demo Scenarios
+`python drone_env_modular.py` runs four back-to-back demo missions (linear, cubic, minimum_jerk, precision). Each:
+1. Takes off to 3 m.
+2. Generates a random track of waypoints with the chosen interpolation.
+3. Commands a precise return to `(0, altitude, 0)` and then a gentle descent toward `(0, 0.5, 0)`.
+4. Lands, disarms, and saves a log image (`demo_<mode>_flight.png`).
+
+Use the demo output to compare interpolation styles and verify the logging pipeline end-to-end.

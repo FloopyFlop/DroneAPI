@@ -17,6 +17,8 @@ Instructions For Drone Software Rebuild:
 
 
 
+
+
 <depend>python3-numpy</depend>
 <depend>python3-matplotlib</depend>
 <depend>rclpy</depend>
@@ -28,3 +30,8 @@ for sys:
 mavsdk
 pymavlink
 pyrealsense2
+
+Topics:
+Installing & Running PX4
+Installing & Running MAVProxy
+Installing ROS2 & Creating a ROS2 Workspace

@@ -625,43 +625,114 @@ class DroneAPI:
 # ---------------------------------------------------------------------------
 
 
-async def _demo():
-    tests = [
-        ("linear", "demo_linear_flight.png"),
-        ("cubic", "demo_cubic_flight.png"),
-        ("minimum_jerk", "demo_minimum_jerk_flight.png"),
-        ("precision", "demo_precision_flight2.png"),
+def _waypoints_with_yaw(
+    points: List[Tuple[float, float, float]],
+    closed: bool = False,
+) -> List[Tuple[float, float, float, float]]:
+    """
+    Annotate a sequence of (x, y, z) waypoints with a yaw derived from the
+    direction of travel to the next point to keep headings consistent.
+    """
+    annotated: List[Tuple[float, float, float, float]] = []
+    total = len(points)
+    for idx, (x, y, z) in enumerate(points):
+        if idx + 1 < total:
+            next_point = points[idx + 1]
+        elif closed and total > 1:
+            next_point = points[0]
+        else:
+            next_point = (x, y, z)
+
+        dx = float(next_point[0] - x)
+        dz = float(next_point[2] - z)
+        if dx == 0.0 and dz == 0.0:
+            yaw = 0.0
+        else:
+            yaw = float(np.rad2deg(np.arctan2(dx, dz)))
+        annotated.append((float(x), float(y), float(z), yaw))
+    return annotated
+
+
+def _build_square_path(side_length: float, altitude: float) -> List[Tuple[float, float, float, float]]:
+    half = side_length / 2.0
+    corners = [
+        (-half, altitude, -half),
+        (half, altitude, -half),
+        (half, altitude, half),
+        (-half, altitude, half),
+        (-half, altitude, -half),
     ]
+    return _waypoints_with_yaw(corners, closed=True)
 
-    rng = np.random.default_rng(seed=42)
+
+def _build_x_path(span: float, altitude: float) -> List[Tuple[float, float, float, float]]:
+    extent = span / 2.0
+    path = [
+        (-extent, altitude, -extent),
+        (extent, altitude, extent),
+        (-extent, altitude, extent),
+        (extent, altitude, -extent),
+        (0.0, altitude, 0.0),
+    ]
+    return _waypoints_with_yaw(path, closed=False)
+
+
+def _build_circle_path(radius: float, altitude: float, samples: int) -> List[Tuple[float, float, float, float]]:
+    angles = np.linspace(0.0, 2.0 * np.pi, samples + 1, endpoint=True)
+    circle_points = [(radius * np.sin(theta), altitude, radius * np.cos(theta)) for theta in angles]
+    return _waypoints_with_yaw(circle_points, closed=True)
+
+
+def _build_curve_path(length: float, altitude: float, samples: int, amplitude: float) -> List[Tuple[float, float, float, float]]:
+    xs = np.linspace(-length / 2.0, length / 2.0, samples)
+    zs = amplitude * np.sin(xs * np.pi / length)
+    points = list(zip(xs, np.full_like(xs, altitude), zs))
+    return _waypoints_with_yaw(points, closed=False)
+
+
+def _build_stop_variations(altitude: float) -> Dict[str, List[Tuple[float, float, float, float]]]:
+    base_track = [
+        (-1.5, altitude, -1.5),
+        (-0.5, altitude, -0.5),
+        (0.0, altitude, 0.0),
+        (0.5, altitude, 0.8),
+        (1.5, altitude, 1.2),
+    ]
+    scenarios: Dict[str, List[Tuple[float, float, float, float]]] = {}
+    for count in range(1, len(base_track) + 1):
+        name = f"stop_{count:02d}_waypoints"
+        scenarios[name] = _waypoints_with_yaw(base_track[:count], closed=False)
+    return scenarios
+
+
+async def _demo():
     initial_altitude = 3.0
+    cubic_scenarios: List[Tuple[str, List[Tuple[float, float, float, float]]]] = [
+        ("square_loop", _build_square_path(side_length=4.0, altitude=initial_altitude)),
+        ("x_pattern", _build_x_path(span=4.0, altitude=initial_altitude)),
+        ("circle_orbit", _build_circle_path(radius=2.5, altitude=initial_altitude, samples=12)),
+        ("s_curve", _build_curve_path(length=6.0, altitude=initial_altitude, samples=9, amplitude=1.5)),
+    ]
+    cubic_scenarios.extend(_build_stop_variations(altitude=initial_altitude).items())
 
-    for method, output_file in tests:
-        print(f"\n=== Running {method} interpolation test ===")
+    for scenario_name, waypoints in cubic_scenarios:
+        print(f"\n=== Running cubic interpolation scenario: {scenario_name} ===")
         drone = DroneAPI(
             system_address="udp://:14540",
-            default_interpolation=method,
+            default_interpolation="cubic",
             log_enabled=True,
-            log_path=output_file,
+            log_path=f"demo_cubic_{scenario_name}.png",
         )
 
-        await drone.begin_mission(initial_altitude=initial_altitude, yaw=0.0)
+        await drone.begin_mission(initial_altitude=initial_altitude, yaw=waypoints[0][3] if waypoints else 0.0)
 
-        # Generate a random waypoint track (x, y, z) within a reasonable cube around the origin.
-        num_waypoints = int(rng.integers(4, 7))
-        random_track = rng.uniform(low=[-2.0, 2.0, -2.0], high=[2.0, 5.0, 2.0], size=(num_waypoints, 3))
-        yaw_samples = rng.uniform(low=-35.0, high=35.0, size=num_waypoints)
-
-        for idx in range(num_waypoints):
-            x, y, z = random_track[idx]
-            yaw = yaw_samples[idx]
-            drone.enqueue_waypoint(float(x), float(y), float(z), yaw=float(yaw), interpolation=method)
+        for x, y, z, yaw in waypoints:
+            drone.enqueue_waypoint(x, y, z, yaw=yaw, interpolation="cubic")
 
         await drone.follow_waypoints()
 
-        # Return to the origin before landing so we touch down at (0,0).
-        await drone.goto(0.0, initial_altitude, 0.0, yaw=0.0, interpolation=method)
-        await drone.goto(0.0, 0.0, 0.0, yaw=0.0, interpolation=method)
+        await drone.goto(0.0, initial_altitude, 0.0, yaw=0.0, interpolation="cubic")
+        await drone.goto(0.0, 0.0, 0.0, yaw=0.0, interpolation="cubic")
 
         await drone.end_mission()
         await drone.shutdown()

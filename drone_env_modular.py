@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Deque, Dict, List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 import numpy as np
 from mavsdk import System
 from mavsdk.offboard import OffboardError, PositionNedYaw, VelocityNedYaw
@@ -550,69 +551,154 @@ class DroneAPI:
                 goal_change_indices.append(i)
         goal_change_times = times[goal_change_indices]
 
-        fig = plt.figure(figsize=(12, 14))
-        gs = fig.add_gridspec(4, 2, height_ratios=[1.2, 1.0, 1.0, 0.9], hspace=0.35, wspace=0.25)
+        cumulative_path = np.concatenate(
+            ([0.0], np.cumsum(np.linalg.norm(np.diff(positions[:, :3], axis=0), axis=1)))
+        )
+        diffs = np.diff(times) if len(times) > 1 else np.array([self.env.control_dt])
+        dt_candidate = float(self.env.control_dt) if getattr(self.env, "control_dt", 0.0) > 0 else float(np.median(diffs))
+        if not np.isfinite(dt_candidate) or dt_candidate <= 0.0:
+            dt_candidate = float(np.median(diffs[diffs > 0])) if np.any(diffs > 0) else 1.0
 
-        ax_path = fig.add_subplot(gs[0, :])
-        ax_path.plot(positions[:, 0], positions[:, 2], label="trajectory", color="C0")
+        accelerations = np.zeros_like(velocities)
+        if len(times) >= 2:
+            accelerations[1:] = np.diff(velocities, axis=0) / dt_candidate
+            accelerations[0] = accelerations[1]
+        accel_magnitude = np.linalg.norm(accelerations, axis=1)
+
+        scale_factor = 3.0 ** 0.5
+        fig = plt.figure(figsize=(12.8 * scale_factor, 4.32 * scale_factor), dpi=400)
+        gs = fig.add_gridspec(
+            2,
+            4,
+            width_ratios=[1.25, 1.0, 1.0, 1.0],
+            height_ratios=[1.0, 1.0],
+            hspace=0.32,
+            wspace=0.28,
+        )
+
+        # Row 0
+        ax_path = fig.add_subplot(gs[0, 0])
+        path_points = np.column_stack((positions[:, 0], positions[:, 2]))
+        path_segments = np.concatenate(
+            [path_points[:-1, None, :], path_points[1:, None, :]],
+            axis=1,
+        )
+        time_norm = plt.Normalize(times[0], times[-1])
+        lc = LineCollection(
+            path_segments,
+            cmap="viridis",
+            norm=time_norm,
+            linewidth=1.6,
+            alpha=0.95,
+        )
+        lc.set_array(times[:-1])
+        ax_path.add_collection(lc)
         unique_goals = goals[goal_change_indices]
-        ax_path.scatter(unique_goals[:, 0], unique_goals[:, 2], color="C1", marker="x", s=60, label="goals")
+        ax_path.scatter(unique_goals[:, 0], unique_goals[:, 2], color="C1", marker="x", s=45, label="goals")
+        ax_path.scatter(positions[0, 0], positions[0, 2], color="C2", s=55, marker="o", label="start")
+        ax_path.scatter(positions[-1, 0], positions[-1, 2], color="C3", s=55, marker="s", label="end")
+        ax_path.set_title("Top-down path (x vs z)", pad=8)
         ax_path.set_xlabel("x (m)")
         ax_path.set_ylabel("z (m)")
-        ax_path.set_title("Top-down path (x vs z)")
-        ax_path.grid(True, linestyle=":")
-        ax_path.axis("equal")
-        ax_path.legend(loc="best")
+        x_span = positions[:, 0].ptp()
+        z_span = positions[:, 2].ptp()
+        max_span = max(x_span, z_span, 1.0)
+        margin = 0.08 * max_span + 0.15
+        ax_path.set_xlim(positions[:, 0].min() - margin, positions[:, 0].max() + margin)
+        ax_path.set_ylim(positions[:, 2].min() - margin, positions[:, 2].max() + margin)
+        if z_span > 0 and x_span > 0:
+            ax_path.set_box_aspect(z_span / x_span)
+        else:
+            ax_path.set_box_aspect(1.0)
+        ax_path.grid(True, linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_path.set_facecolor("#fbfbfb")
+        ax_path.legend(loc="upper left", fontsize=7, frameon=False, handlelength=1.6)
+        cbar = fig.colorbar(lc, ax=ax_path, orientation="vertical", fraction=0.055, pad=0.02)
+        cbar.set_label("time (s)", fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
 
-        ax_pos_x = fig.add_subplot(gs[1, 0])
-        ax_pos_x.plot(times, positions[:, 0], label="x actual", color="C0")
-        ax_pos_x.plot(times, goals[:, 0], "--", label="x target", color="C1")
+        ax_pos_x = fig.add_subplot(gs[0, 1])
+        ax_pos_x.plot(times, positions[:, 0], label="x", color="C0", linewidth=1.2)
+        ax_pos_x.plot(times, goals[:, 0], linestyle="--", label="x goal", color="C1", linewidth=1.0)
         for t in goal_change_times:
-            ax_pos_x.axvline(t, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
+            ax_pos_x.axvline(t, color="gray", linestyle=":", linewidth=0.6, alpha=0.6)
+        ax_pos_x.set_title("x position vs target", pad=8)
         ax_pos_x.set_ylabel("x (m)")
-        ax_pos_x.grid(True, linestyle=":")
-        ax_pos_x.legend(loc="upper right")
+        ax_pos_x.grid(True, linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_pos_x.legend(loc="upper left", fontsize=7, frameon=False, handlelength=1.6)
 
-        ax_pos_z = fig.add_subplot(gs[1, 1])
-        ax_pos_z.plot(times, positions[:, 2], label="z actual", color="C0")
-        ax_pos_z.plot(times, goals[:, 2], "--", label="z target", color="C1")
+        ax_pos_y = fig.add_subplot(gs[0, 2])
+        ax_pos_y.plot(times, positions[:, 1], label="y", color="C0", linewidth=1.2)
+        ax_pos_y.plot(times, goals[:, 1], linestyle="--", label="y goal", color="C1", linewidth=1.0)
         for t in goal_change_times:
-            ax_pos_z.axvline(t, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
+            ax_pos_y.axvline(t, color="gray", linestyle=":", linewidth=0.6, alpha=0.6)
+        ax_pos_y.set_title("y position vs target", pad=8)
+        ax_pos_y.set_ylabel("y (m)")
+        ax_pos_y.grid(True, linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_pos_y.legend(loc="upper left", fontsize=7, frameon=False, handlelength=1.6)
+
+        ax_pos_z = fig.add_subplot(gs[0, 3])
+        ax_pos_z.plot(times, positions[:, 2], label="z", color="C0", linewidth=1.2)
+        ax_pos_z.plot(times, goals[:, 2], linestyle="--", label="z goal", color="C1", linewidth=1.0)
+        for t in goal_change_times:
+            ax_pos_z.axvline(t, color="gray", linestyle=":", linewidth=0.6, alpha=0.6)
+        ax_pos_z.set_title("z position vs target", pad=8)
         ax_pos_z.set_ylabel("z (m)")
-        ax_pos_z.grid(True, linestyle=":")
-        ax_pos_z.legend(loc="upper right")
+        ax_pos_z.grid(True, linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_pos_z.legend(loc="upper left", fontsize=7, frameon=False, handlelength=1.6)
 
-        ax_alt = fig.add_subplot(gs[2, 0])
-        ax_alt.plot(times, positions[:, 1], label="y actual", color="C0")
-        ax_alt.plot(times, goals[:, 1], "--", label="y target", color="C1")
+        # Row 1
+        ax_vel_components = fig.add_subplot(gs[1, 0])
+        ax_vel_components.plot(times, velocities[:, 0], label="vx", color="C0", linewidth=1.1)
+        ax_vel_components.plot(times, velocities[:, 1], label="vy", color="C1", linewidth=1.1)
+        ax_vel_components.plot(times, velocities[:, 2], label="vz", color="C2", linewidth=1.1)
         for t in goal_change_times:
-            ax_alt.axvline(t, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
-        ax_alt.set_ylabel("y (m)")
-        ax_alt.set_xlabel("time (s)")
-        ax_alt.grid(True, linestyle=":")
-        ax_alt.legend(loc="upper right")
+            ax_vel_components.axvline(t, color="gray", linestyle=":", linewidth=0.6, alpha=0.6)
+        ax_vel_components.set_title("Velocity components", pad=8)
+        ax_vel_components.set_ylabel("velocity (m/s)")
+        ax_vel_components.set_xlabel("time (s)")
+        ax_vel_components.grid(True, linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_vel_components.legend(loc="upper left", fontsize=7, frameon=False, ncol=2, handlelength=1.6)
 
-        ax_vel = fig.add_subplot(gs[2, 1])
-        ax_vel.plot(times, velocities[:, 0], label="vx", color="C0")
-        ax_vel.plot(times, velocities[:, 1], label="vy", color="C1")
-        ax_vel.plot(times, velocities[:, 2], label="vz", color="C2")
-        ax_vel.plot(times, speed, label="speed", color="C3", linewidth=1.5)
-        ax_vel.set_ylabel("velocity (m/s)")
-        ax_vel.set_xlabel("time (s)")
-        ax_vel.grid(True, linestyle=":")
-        ax_vel.legend(loc="upper right")
-
-        ax_dist = fig.add_subplot(gs[3, :])
-        ax_dist.plot(times, distances, color="C4")
+        ax_speed = fig.add_subplot(gs[1, 1])
+        ax_speed.plot(times, speed, color="C3", linewidth=1.3)
         for t in goal_change_times:
-            ax_dist.axvline(t, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
-        ax_dist.set_ylabel("distance to goal (m)")
-        ax_dist.set_xlabel("time (s)")
-        ax_dist.grid(True, linestyle=":")
-        ax_dist.set_title("Distance to active goal")
+            ax_speed.axvline(t, color="gray", linestyle=":", linewidth=0.6, alpha=0.6)
+        ax_speed.set_title("Speed (||v||)", pad=8)
+        ax_speed.set_ylabel("speed (m/s)")
+        ax_speed.set_xlabel("time (s)")
+        ax_speed.grid(True, linestyle=":", linewidth=0.7, alpha=0.65)
 
-        fig.tight_layout()
-        plt.savefig(path, dpi=200)
+        ax_accel = fig.add_subplot(gs[1, 2])
+        ax_accel.plot(times, accelerations[:, 0], label="ax", color="C0", linewidth=1.1)
+        ax_accel.plot(times, accelerations[:, 1], label="ay", color="C1", linewidth=1.1)
+        ax_accel.plot(times, accelerations[:, 2], label="az", color="C2", linewidth=1.1)
+        ax_accel.plot(times, accel_magnitude, label="|a|", color="C4", linewidth=1.3, linestyle="--")
+        for t in goal_change_times:
+            ax_accel.axvline(t, color="gray", linestyle=":", linewidth=0.6, alpha=0.6)
+        ax_accel.set_title("Acceleration profile", pad=8)
+        ax_accel.set_ylabel("acceleration (m/s²)")
+        ax_accel.set_xlabel("time (s)")
+        ax_accel.grid(True, linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_accel.legend(loc="upper left", fontsize=7, frameon=False, ncol=2, handlelength=1.6)
+
+        ax_distance = fig.add_subplot(gs[1, 3])
+        ax_distance.plot(times, distances, color="C5", linewidth=1.3, label="distance to goal")
+        ax_distance.plot(times, cumulative_path, color="C6", linewidth=1.0, linestyle="--", label="path length")
+        for t in goal_change_times:
+            ax_distance.axvline(t, color="gray", linestyle=":", linewidth=0.6, alpha=0.6)
+        ax_distance.set_title("Goal distance & path length", pad=8)
+        ax_distance.set_ylabel("meters")
+        ax_distance.set_xlabel("time (s)")
+        ax_distance.grid(True, linestyle=":", linewidth=0.7, alpha=0.65)
+        ax_distance.legend(loc="upper left", fontsize=7, frameon=False, handlelength=1.6)
+
+        for ax in fig.axes:
+            ax.tick_params(labelsize=8)
+
+        fig.patch.set_facecolor("white")
+
+        plt.savefig(path, dpi=320, bbox_inches="tight", pad_inches=0.12)
         plt.close(fig)
         self.end_logging()
 
@@ -721,7 +807,7 @@ async def _demo():
             system_address="udp://:14540",
             default_interpolation="cubic",
             log_enabled=True,
-            log_path=f"demo_cubic_{scenario_name}.png",
+            log_path=f"/media/sf_Testing/demo_cubic_{scenario_name}.png",
         )
 
         await drone.begin_mission(initial_altitude=initial_altitude, yaw=waypoints[0][3] if waypoints else 0.0)

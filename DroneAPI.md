@@ -48,7 +48,7 @@ All movement commands require that `begin_mission()` has already been awaited so
 - `linear` – straight-line position samples with constant-speed velocity targets.
 - `cubic` – clamped cubic splines (zero velocity at endpoints) for smooth arrivals.
 - `minimum_jerk` – quintic easing curve for gradual acceleration and deceleration.
-- `precision` – step toward the goal in a straight line, ignoring future waypoints. The drone keeps inching forward until it is within `precision_tolerance` meters of the target. Useful when you need accurate stops more than path smoothness.
+- `precision` – repeatedly reissues a position hold on the current goal, waiting until the drone is both within `precision_tolerance` and almost stationary before releasing the next waypoint. Ideal when you need simple, stop-on-target behavior.
 
 Change the default with `default_interpolation` in the constructor or per-call via the `interpolation` argument.
 
@@ -56,6 +56,7 @@ Change the default with `default_interpolation` in the constructor or per-call v
 The constructor exposes two tuning knobs:
 - `precision_tolerance` (meters, default `0.1`) – distance required before the next waypoint is released.
 - `precision_timeout_sec` (default `20.0`) – safety cap on how long the precision controller will try before emitting a warning and moving on.
+- The controller also waits for the speed to fall below roughly `0.05 m/s` before advancing, so the vehicle settles on each target.
 
 ## Logging & Flight Plots
 - Pass `log_enabled=True` (and optionally `log_path="flight_log.png"`) to record telemetry.

@@ -10,10 +10,6 @@ from mavsdk import System
 from mavsdk.offboard import OffboardError, PositionNedYaw, VelocityNedYaw
 from scipy.interpolate import CubicSpline
 
-
-PRECISION_METHOD = "precision"
-
-
 def _to_np(values: Union[List[float], np.ndarray]) -> np.ndarray:
     return values if isinstance(values, np.ndarray) else np.array(values, dtype=float)
 
@@ -287,7 +283,7 @@ class DroneAPI:
         self.takeoff_settle_sec = float(takeoff_settle_sec)
         self.velocity_ramp_sec = float(max(0.0, velocity_ramp_sec))
         self._update_velocity_ramp_steps()
-        self.precision_method = PRECISION_METHOD
+        self.precision_method = "precision"
         self.precision_tolerance = float(max(precision_tolerance, 0.0))
         self.precision_timeout_sec = float(max(precision_timeout_sec, self.env.control_dt))
 
@@ -483,58 +479,30 @@ class DroneAPI:
                 self.telemetry_log.append(self._make_log_sample(target_local=target_local))
 
     async def _fly_precise(self, target_local: np.ndarray) -> None:
-        max_step_distance = max(self.interpolator.max_speed * self.env.control_dt, 1e-3)
         max_iterations = max(int(self.precision_timeout_sec / self.env.control_dt), 1)
         yaw_deg = float(target_local[3])
+        target_world = target_local[:3] + self.env.offset_xyz
+        stop_speed_threshold = 0.05
 
         for _ in range(max_iterations):
+            await self.env.command_position(target_world, yaw_deg=yaw_deg)
+            await asyncio.sleep(self.env.control_dt)
             await self.env.update_state()
+
             position_local = self.env.position_xyz - self.env.offset_xyz
-            error_vec = target_local[:3] - position_local
-            distance = float(np.linalg.norm(error_vec))
+            distance = float(np.linalg.norm(target_local[:3] - position_local))
+            velocity_mag = float(np.linalg.norm(self.env.velocity_xyz))
 
             if self.log_enabled:
                 self.telemetry_log.append(self._make_log_sample(target_local=target_local))
 
-            if distance <= self.precision_tolerance:
+            if distance <= self.precision_tolerance and velocity_mag <= stop_speed_threshold:
                 break
-
-            if distance > 1e-6:
-                direction = error_vec / distance
-            else:
-                direction = np.zeros(3, dtype=float)
-
-            step_distance = min(distance, max_step_distance)
-            next_local = position_local + direction * step_distance
-            world_xyz = next_local + self.env.offset_xyz
-
-            velocity_xyz_yaw = None
-            if self.use_velocity_command and distance > 1e-6:
-                commanded_speed = min(self.interpolator.max_speed, distance / self.env.control_dt)
-                velocity_xyz_yaw = np.array(
-                    [
-                        direction[0] * commanded_speed,
-                        direction[1] * commanded_speed,
-                        direction[2] * commanded_speed,
-                        0.0,
-                    ],
-                    dtype=float,
-                )
-
-            await self.env.command_position(world_xyz, yaw_deg=yaw_deg, velocity_xyz_yaw=velocity_xyz_yaw)
-            await asyncio.sleep(self.env.control_dt)
         else:
             print(
                 f"-- Precision interpolation timed out before reaching tolerance "
                 f"{self.precision_tolerance:.2f} m"
             )
-
-        target_world = target_local[:3] + self.env.offset_xyz
-        await self.env.command_position(target_world, yaw_deg=yaw_deg)
-        await asyncio.sleep(self.env.control_dt)
-        if self.log_enabled:
-            await self.env.update_state()
-            self.telemetry_log.append(self._make_log_sample(target_local=target_local))
 
     # ----- Logging ----------------------------------------------------------
 
@@ -662,7 +630,7 @@ async def _demo():
         ("linear", "demo_linear_flight.png"),
         ("cubic", "demo_cubic_flight.png"),
         ("minimum_jerk", "demo_minimum_jerk_flight.png"),
-        (PRECISION_METHOD, "demo_precision_flight.png"),
+        ("precision", "demo_precision_flight2.png"),
     ]
 
     rng = np.random.default_rng(seed=42)

@@ -1,0 +1,38 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+
+# Virtual environments and env files
+venv/
+env/
+ENV/
+.venv/
+.env
+.python-version
+
+# Test / cache / tooling
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.pyre/
+.ropeproject/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# macOS
+.DS_Store
+
+# Ignore the Testing folder (top-level)
+Testing/

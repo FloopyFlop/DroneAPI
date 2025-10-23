@@ -15,7 +15,7 @@ from .interpolation import (
     InterpContext,
     InterpOutput,
     BaseInterpolation,
-    Precision,   # default fallback (GOTO)
+    Linear,   # default fallback (GOTO)
 )
 
 # ------------------ utilities ------------------
@@ -207,7 +207,7 @@ class DroneAPI:
         self,
         system_address: str = "udp://:14540",
         control_rate_hz: float = 10.0,
-        default_interpolation: Type[BaseInterpolation] = Precision,
+        default_interpolation: Type[BaseInterpolation] = Linear,
         max_speed_m_s: float = 1.5,
         use_velocity_command: bool = True,
         *,

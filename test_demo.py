@@ -30,33 +30,36 @@ def build_square(side=4.0, alt=3.0):
 
 async def _async_main():
     initial_altitude = 3.0
-
-    drone = DroneAPI(
-        system_address="udp://:14540",
-        default_interpolation=Precision,   # global default (GOTO)
-        control_rate_hz=10.0,
-        max_speed_m_s=1.5,
-        use_velocity_command=True,
-    )
-
-    await drone.begin_mission(initial_altitude=initial_altitude, yaw=0.0)
-
-    # Enqueue a loop with different interpolations per leg
     waypoints = build_square(side=4.0, alt=initial_altitude)
-    interps = [Linear, Cubic, MinJerk, Precision, Cubic]
+    interps = [["Cubic", Cubic], ["Linear", Linear], ["MinJerk", MinJerk], ["Precision", Precision]]
 
-    for (x, y, z, yaw), interp in zip(waypoints, interps):
-        drone.enqueue_waypoint(x, y, z, yaw=yaw, interpolation=interp, threshold=0.20)
+    for i in range(len(interps)):
+        print("Starting demo with {} interpolation...".format(interps[i][0]))
+        drone = DroneAPI(
+            system_address="udp://:14540",
+            default_interpolation=Precision,   # global default (GOTO)
+            control_rate_hz=10.0,
+            max_speed_m_s=1.5,
+            use_velocity_command=True,
+            # ---- TURN LOGGING ON + CHOOSE WHERE TO SAVE ----
+            log_enabled=True,
+            log_path="/media/sf_Testing/{}Demo".format(interps[i][0]),
+        )
 
-    await drone.follow_waypoints()
+        await drone.begin_mission(initial_altitude=initial_altitude, yaw=0.0)
 
-    # Return home
-    drone.enqueue_waypoint(0.0, initial_altitude, 0.0, yaw=0.0, interpolation=Cubic, threshold=0.15)
-    drone.enqueue_waypoint(0.0, 0.0, 0.0, yaw=0.0, interpolation=MinJerk, threshold=0.15)
-    await drone.follow_waypoints()
+        for (x, y, z, yaw) in waypoints:
+            drone.enqueue_waypoint(x, y, z, yaw=yaw, interpolation=interps[i][1], threshold=0.20)
 
-    await drone.end_mission()
-    await drone.shutdown()
+        await drone.follow_waypoints()
+
+        # Return home
+        drone.enqueue_waypoint(0.0, initial_altitude, 0.0, yaw=0.0, interpolation=Cubic, threshold=0.15)
+        drone.enqueue_waypoint(0.0, 0.0, 0.0, yaw=0.0, interpolation=MinJerk, threshold=0.15)
+        await drone.follow_waypoints()
+
+        await drone.end_mission()
+        await drone.shutdown()
 
 
 def main() -> None:
@@ -70,4 +73,3 @@ def main() -> None:
 if __name__ == "__main__":
     print("Starting test_demo.py...")
     main()
-

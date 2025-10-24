@@ -1,11 +1,11 @@
 # test_demo.py
 import asyncio
 import numpy as np
+from typing import List, Tuple
 
 from .magpie import DroneAPI
 from .interpolation import (
-    Cubic, Linear,
-    TrapezoidalVelocity, PDVelocity, Bezier, LookAheadBlend, SineEase
+    Cubic, Linear, TrapezoidalVelocity, Bezier, BarrelTowards
 )
 
 # ---------- helpers ----------
@@ -32,13 +32,13 @@ def build_square(side=4.0, alt=3.0):
     return _with_yaw(pts, closed=True)
 
 
-def build_circle(radius=2.5, alt=3.0, samples=24):
+def build_circle(radius=2.5, alt=3.0, samples=36):
     thetas = np.linspace(0, 2*np.pi, samples+1, endpoint=True)
     pts = [(radius*np.sin(t), alt, radius*np.cos(t)) for t in thetas]
     return _with_yaw(pts, closed=True)
 
 
-def build_dense_curve(length=8.0, alt=3.0, samples=80, amp=1.5):
+def build_dense_curve(length=10.0, alt=3.0, samples=120, amp=1.8):
     xs = np.linspace(-length/2.0, length/2.0, samples)
     zs = amp * np.sin(xs * np.pi / (length/1.2)) * np.cos(xs * np.pi / (length/2.0))
     pts = list(zip(xs, np.full_like(xs, alt), zs))
@@ -57,29 +57,42 @@ def _rot_xyz(p, rx_deg=0.0, ry_deg=0.0, rz_deg=0.0):
     return (R @ p.reshape(3,1)).ravel()
 
 
-def build_star3d_tilted(size=3.0, alt=3.0, tilt=(25.0, 15.0, 30.0)):
-    """
-    Build a 5-point star in XZ plane, then tilt in 3D and offset altitude.
-    """
-    # 5-point star vertices (unit scale)
+def build_star3d_tilted(size=3.0, alt=3.0, tilt=(25.0, 15.0, 35.0)):
+    # 5-point star on XZ, then tilt
     angles_outer = np.deg2rad(np.linspace(-90, 270, 5, endpoint=False))
-    angles_inner = angles_outer + np.deg2rad(36)  # 360/10
+    angles_inner = angles_outer + np.deg2rad(36)
     r_outer = 1.0
     r_inner = 0.4
     verts = []
     for i in range(5):
         verts.append((r_outer*np.cos(angles_outer[i]), r_outer*np.sin(angles_outer[i])))
         verts.append((r_inner*np.cos(angles_inner[i]), r_inner*np.sin(angles_inner[i])))
-    verts.append(verts[0])  # close
-
-    # Scale and map to (x,z); y = 0 then tilt
+    verts.append(verts[0])
     pts = []
     for x0, z0 in verts:
         p = np.array([size*x0, 0.0, size*z0])
         pr = _rot_xyz(p, *tilt)
         pts.append((pr[0], alt + pr[1], pr[2]))
-
     return _with_yaw(pts, closed=True)
+
+
+async def _run_waypoints_with_timeout(
+    drone: DroneAPI,
+    waypoints: List[Tuple[float, float, float, float]],
+    interp_cls,
+    segment_timeout: float = 20.0,
+    threshold: float = 0.20,
+):
+    """
+    Enqueue and fly each waypoint as its own 'segment' with a timeout.
+    If a segment doesn't finish in time, raise TimeoutError to fail the test run.
+    """
+    for (x, y, z, yaw) in waypoints:
+        drone.enqueue_waypoint(x, y, z, yaw=yaw, interpolation=interp_cls, threshold=threshold)
+        try:
+            await asyncio.wait_for(drone.follow_waypoints(), timeout=segment_timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Segment to ({x:.2f},{y:.2f},{z:.2f}) timed out for {interp_cls.__name__}")
 
 
 # ---------- test runner ----------
@@ -87,7 +100,6 @@ def build_star3d_tilted(size=3.0, alt=3.0, tilt=(25.0, 15.0, 30.0)):
 async def _async_main():
     initial_altitude = 3.0
 
-    # Scenarios to test
     scenarios = [
         ("square", build_square(side=4.0, alt=initial_altitude)),
         ("circle", build_circle(radius=2.5, alt=initial_altitude, samples=36)),
@@ -95,25 +107,22 @@ async def _async_main():
         ("star3d_tilted", build_star3d_tilted(size=3.0, alt=initial_altitude, tilt=(25, 15, 35))),
     ]
 
-    # Interpolations to test (Precision/MinJerk removed)
     interps = [
-        ("Cubic", Cubic),
-        ("Linear", Linear),
-        ("TrapezoidalVelocity", TrapezoidalVelocity),
-        ("PDVelocity", PDVelocity),
-        ("Bezier", Bezier),
-        ("LookAheadBlend", LookAheadBlend),
-        ("SineEase", SineEase),
+        ("BarrelTowards", BarrelTowards),         # pass-through
+        ("Bezier", Bezier),                       # pass-through
+        ("Linear", Linear),                       # pass-through if next exists
+        ("TrapezoidalVelocity", TrapezoidalVelocity),  # stop
+        ("Cubic", Cubic),                         # stop
     ]
 
-    # Run each interpolation on each scenario in its own mission (fresh logs)
+    # Run each interpolation on each scenario as its own mission (fresh logs)
     for name_interp, interp_cls in interps:
         for name_scn, waypoints in scenarios:
             print(f"\n=== Starting demo: interp={name_interp} scenario={name_scn} ===")
 
             drone = DroneAPI(
                 system_address="udp://:14540",
-                default_interpolation=interp_cls,   # global default for this run
+                default_interpolation=interp_cls,
                 control_rate_hz=10.0,
                 max_speed_m_s=1.5,
                 use_velocity_command=True,
@@ -123,15 +132,22 @@ async def _async_main():
 
             await drone.begin_mission(initial_altitude=initial_altitude, yaw=0.0)
 
-            for (x, y, z, yaw) in waypoints:
-                drone.enqueue_waypoint(x, y, z, yaw=yaw, interpolation=interp_cls, threshold=0.20)
+            # Fly the scenario with per-segment timeouts
+            try:
+                await _run_waypoints_with_timeout(
+                    drone, waypoints, interp_cls, segment_timeout=25.0, threshold=0.20
+                )
+            except TimeoutError as e:
+                print(f"[FAIL] {e}")
 
-            await drone.follow_waypoints()
-
-            # Return home (use Cubic both legs since MinJerk/Precision removed)
-            drone.enqueue_waypoint(0.0, initial_altitude, 0.0, yaw=0.0, interpolation=Cubic, threshold=0.15)
-            drone.enqueue_waypoint(0.0, 0.0, 0.0, yaw=0.0, interpolation=Cubic, threshold=0.15)
-            await drone.follow_waypoints()
+            # Return home using Cubic stop-then-land
+            try:
+                await _run_waypoints_with_timeout(
+                    drone, [(0.0, initial_altitude, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)],
+                    Cubic, segment_timeout=25.0, threshold=0.15
+                )
+            except TimeoutError as e:
+                print(f"[FAIL] (return) {e}")
 
             await drone.end_mission()
             await drone.shutdown()

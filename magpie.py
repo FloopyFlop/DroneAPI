@@ -203,8 +203,7 @@ class DroneAPI:
         await drone.follow_waypoints()
     """
 
-    def __init__(
-        self,
+    def __init__(self,
         system_address: str = "udp://:14540",
         control_rate_hz: float = 10.0,
         default_interpolation: Type[BaseInterpolation] = Linear,
@@ -213,6 +212,7 @@ class DroneAPI:
         *,
         log_enabled: bool = False,
         log_path: Optional[str] = None,
+        segment_timeout_sec: float = 25.0,      # <--- NEW
     ):
         self.system_address = system_address
         self.env = MagpieEnv(control_rate_hz=control_rate_hz)
@@ -224,6 +224,8 @@ class DroneAPI:
         self._waypoint_queue: Deque[Waypoint] = deque()
         self._current_yaw = 0.0
         self._mission_started = False
+        
+        self._segment_timeout_sec = float(segment_timeout_sec)
 
         # ---- logging state ----
         self.log_enabled = bool(log_enabled)
@@ -231,6 +233,16 @@ class DroneAPI:
         self._mission_start = 0.0
         self.telemetry_log: List[Dict[str, np.ndarray]] = []
         self.goal_history: List[np.ndarray] = []
+    
+    @staticmethod
+    def _movement_intersects_sphere(a: np.ndarray, b: np.ndarray, center: np.ndarray, radius: float) -> bool:
+        ab = b - a
+        ab2 = float(np.dot(ab, ab))
+        if ab2 < 1e-12:
+            return float(np.linalg.norm(a - center)) <= radius
+        t = float(np.clip(np.dot(center - a, ab) / ab2, 0.0, 1.0))
+        closest = a + t * ab
+        return float(np.linalg.norm(closest - center)) <= radius
 
     # ---------- mission lifecycle ----------
 
@@ -276,18 +288,15 @@ class DroneAPI:
     # ---------- queue management ----------
 
     def enqueue_waypoint(
-        self,
-        x: float,
-        y: float,
-        z: float,
-        yaw: float = 0.0,
+        self, x: float, y: float, z: float, yaw: float = 0.0,
         interpolation: Optional[Type[BaseInterpolation]] = None,
         threshold: Optional[float] = None,
     ) -> None:
         self._waypoint_queue.append(
             Waypoint(
-                x=float(x), y=float(y), z=float(z), yaw=float(y),
-                interpolation=interpolation, threshold=float(threshold) if threshold is not None else 0.15
+                x=float(x), y=float(y), z=float(z), yaw=float(yaw),   # <- fixed
+                interpolation=interpolation,
+                threshold=float(threshold) if threshold is not None else 0.15,
             )
         )
 
@@ -350,7 +359,8 @@ class DroneAPI:
         if self.log_enabled:
             self.telemetry_log.append(self._make_log_sample(target_local=target_local))
 
-        # control loop until strategy says done
+        prev_pos = start_pos.copy()
+        t0 = time.time()
         while True:
             await self.env.update_state()
 
@@ -366,16 +376,35 @@ class DroneAPI:
             desired_local_pos = out.position_local if out.position_local is not None else target_local
             world_xyz = desired_local_pos + self.env.offset_xyz
             yaw_cmd = float(out.yaw_deg if out.yaw_deg is not None else target_yaw)
-
             vel_cmd = out.velocity_xyz_yaw if (self.use_velocity_command and out.velocity_xyz_yaw is not None) else None
 
             await self.env.command_position(world_xyz, yaw_deg=yaw_cmd, velocity_xyz_yaw=vel_cmd)
-            self._current_yaw = yaw_cmd  # track commanded yaw
+            self._current_yaw = yaw_cmd
             await asyncio.sleep(self.control_dt)
 
             # log a sample each tick
             if self.log_enabled:
                 self.telemetry_log.append(self._make_log_sample(target_local=target_local))
+
+            # --------- robust completion guards ----------
+            # 1) if I'm simply inside the sphere, count it as done
+            if not out.done:
+                if float(np.linalg.norm(ctx.now_state_pos - target_local)) <= max(wp.threshold, 1e-6):
+                    out.done = True
+
+            # 2) movement segment intersected the sphere (line-through-sphere)
+            if not out.done:
+                dyn_tol = float(wp.threshold + 0.8 * float(np.linalg.norm(self.env.velocity_xyz)) * self.control_dt)
+                if self._movement_intersects_sphere(prev_pos, ctx.now_state_pos, target_local, dyn_tol):
+                    out.done = True
+
+            # 3) watchdog
+            if not out.done and (time.time() - t0) > self._segment_timeout_sec:
+                print(f"-- Segment watchdog tripped at {self._segment_timeout_sec:.1f}s; forcing completion.")
+                out.done = True
+
+            prev_pos = ctx.now_state_pos.copy()
+            # ---------------------------------------------
 
             if out.done:
                 break

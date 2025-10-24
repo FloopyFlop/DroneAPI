@@ -4,9 +4,8 @@ import numpy as np
 from typing import List, Tuple
 
 from .magpie import DroneAPI
-from .interpolation import (
-    Cubic, Linear, TrapezoidalVelocity, Bezier, BarrelTowards
-)
+from .interpolation import Cubic, TrapezoidalVelocity, Linear, Bezier, BarrelTowards, L1Guidance
+
 
 # ---------- helpers ----------
 
@@ -108,11 +107,12 @@ async def _async_main():
     ]
 
     interps = [
-        ("BarrelTowards", BarrelTowards),         # pass-through
-        ("Bezier", Bezier),                       # pass-through
-        ("Linear", Linear),                       # pass-through if next exists
+        ("L1Guidance", L1Guidance),            # recommended pass-through
+        ("Linear", Linear),
+        ("Bezier", Bezier),
+        ("BarrelTowards", BarrelTowards),
         ("TrapezoidalVelocity", TrapezoidalVelocity),  # stop
-        ("Cubic", Cubic),                         # stop
+        ("Cubic", Cubic),                               # stop
     ]
 
     # Run each interpolation on each scenario as its own mission (fresh logs)

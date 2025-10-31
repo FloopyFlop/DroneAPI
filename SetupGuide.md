@@ -6,6 +6,11 @@ Both - `( cd ~/Documents/MAVProxy && mavproxy.py --master=udp:127.0.0.1:14550 >/
 Instructions For Drone Software Rebuild:
 `colcon build --packages-select modular1 && source install/setup.bash && ros2 run modular1 service`
 
+Or for other service titles:
+`colcon build --packages-select modular1 && source install/setup.bash && ros2 run modular1 a`
+`colcon build --packages-select modular1 && source install/setup.bash && ros2 run modular1 b`
+`colcon build --packages-select modular1 && source install/setup.bash && ros2 run modular1 c`
+
 1. run with the project name as [PROJECT] and space separated deps as [DEPS] ex. rclpy mavsdk `ros2 pkg create --build-type ament_python --license Apache-2.0 [PROJECT] --dependencies [DEPS]`
 2. Add python code to the ./[PROJECT]/ directory alongside __init__.py
 3. Then in ./setup.py add `"[service_name] = [PROJECT].[file_name_no_py]:main"`

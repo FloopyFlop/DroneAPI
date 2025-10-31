@@ -1,9 +1,12 @@
 # magpie.py
 import asyncio
+import json
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Tuple, Type, Union
+from enum import Enum
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Type, Union
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
@@ -34,6 +37,285 @@ class Waypoint:
     threshold: float = 0.15  # per-waypoint tolerance override (meters)
 
 
+# ------------------ ROS2 publisher helpers ------------------
+
+class _BaseStatePublisher:
+    """Minimal interface so DroneAPI can swap publishers for ROS2 or tests."""
+
+    def publish(self, payload: str) -> None:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def close(self) -> None:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class _Ros2StatePublisher(_BaseStatePublisher):
+    """
+    ROS 2 publisher that spins in a background thread.
+
+    Designed so DroneAPI can publish JSON snapshots without tying up the main asyncio loop.
+    """
+
+    def __init__(self, topic: str, node_name: str, qos_depth: int):
+        try:
+            import rclpy
+            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.node import Node
+            from std_msgs.msg import String
+        except ImportError as exc:  # pragma: no cover - ROS2 optional dependency
+            raise RuntimeError(
+                "ROS 2 telemetry streaming requested, but rclpy/std_msgs are not installed."
+            ) from exc
+
+        self._rclpy = rclpy
+        self._String = String
+        self._executor = SingleThreadedExecutor()
+        self._lock = threading.Lock()
+        self._topic = topic
+        self._running = threading.Event()
+        self._running.set()
+        self._owns_context = False
+
+        if not self._rclpy.ok():
+            self._rclpy.init(args=None)
+            self._owns_context = True
+
+        self._node = Node(node_name)
+        self._publisher = self._node.create_publisher(String, topic, qos_depth)
+        self._executor.add_node(self._node)
+
+        self._spin_thread = threading.Thread(target=self._spin, name=f"{node_name}_spin", daemon=True)
+        self._spin_thread.start()
+
+    def _spin(self) -> None:
+        while self._running.is_set() and self._rclpy.ok():  # pragma: no cover - background thread
+            try:
+                self._executor.spin_once(timeout_sec=0.05)
+            except Exception:
+                break
+
+    def publish(self, payload: str) -> None:
+        if not self._running.is_set():
+            return
+        msg = self._String()
+        msg.data = payload
+        with self._lock:
+            self._publisher.publish(msg)
+
+    def close(self) -> None:
+        if not self._running.is_set():
+            return
+        self._running.clear()
+        try:
+            self._executor.call_soon_threadsafe(lambda: None)
+        except Exception:
+            pass
+
+        if self._spin_thread.is_alive():
+            self._spin_thread.join(timeout=1.5)
+
+        with self._lock:
+            try:
+                self._executor.remove_node(self._node)
+            except Exception:
+                pass
+            try:
+                self._node.destroy_publisher(self._publisher)
+            except Exception:
+                pass
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+
+        try:
+            self._executor.shutdown()
+        except Exception:
+            pass
+
+        if self._owns_context and self._rclpy.ok():
+            self._rclpy.shutdown()
+
+
+# ------------------ Telemetry collector ------------------
+
+class TelemetryCollector:
+    """
+    Subscribes to every available MAVSDK telemetry stream and forwards updates.
+    """
+
+    # (alias, attribute_name)
+    CANDIDATE_STREAMS: Tuple[Tuple[str, str], ...] = (
+        ("position", "position"),
+        ("home", "home"),
+        ("position_velocity_ned", "position_velocity_ned"),
+        ("velocity_ned", "velocity_ned"),
+        ("ground_speed_ned", "ground_speed_ned"),
+        ("attitude_euler", "attitude_euler"),
+        ("attitude_quaternion", "attitude_quaternion"),
+        ("angular_velocity_body", "angular_velocity_body"),
+        ("linear_acceleration_body", "linear_acceleration_body"),
+        ("imu", "imu"),
+        ("scaled_imu", "scaled_imu"),
+        ("raw_imu", "raw_imu"),
+        ("magnetometer", "magnetometer"),
+        ("gps_info", "gps_info"),
+        ("gps_raw", "raw_gps"),
+        ("health", "health"),
+        ("health_all_ok", "health_all_ok"),
+        ("battery", "battery"),
+        ("flight_mode", "flight_mode"),
+        ("status_text", "status_text"),
+        ("unix_epoch_time", "unix_epoch_time"),
+        ("distance_sensor", "distance_sensor"),
+        ("landed_state", "landed_state"),
+        ("in_air", "in_air"),
+        ("odometry", "odometry"),
+        ("fixedwing_metrics", "fixedwing_metrics"),
+        ("actuator_control_target", "actuator_control_target"),
+        ("actuator_output_status", "actuator_output_status"),
+        ("rc_status", "rc_status"),
+        ("airspeed", "airspeed"),
+        ("heading", "heading"),
+        ("acceleration_ned", "acceleration_ned"),
+        ("camera_attitude_euler", "camera_attitude_euler"),
+        ("camera_attitude_quaternion", "camera_attitude_quaternion"),
+    )
+
+    def __init__(self, system: System, on_stream_update: Callable[[str, Dict[str, Any]], None]):
+        self._system = system
+        self._on_stream_update = on_stream_update
+        self._tasks: List[asyncio.Task] = []
+        self._generators: List[Any] = []
+        self._running = False
+        self._active_streams: List[str] = []
+
+    @property
+    def active_streams(self) -> List[str]:
+        return list(self._active_streams)
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._tasks.clear()
+        self._generators.clear()
+        self._active_streams.clear()
+
+        for alias, attr_name in self.CANDIDATE_STREAMS:
+            attr = getattr(self._system.telemetry, attr_name, None)
+            if attr is None or not callable(attr):
+                continue
+            try:
+                generator = attr()
+            except TypeError:
+                continue
+            except Exception as exc:
+                print(f"[WARN] Telemetry stream '{attr_name}' failed to start: {exc}")
+                continue
+
+            task = asyncio.create_task(self._consume_stream(alias, generator))
+            self._tasks.append(task)
+            self._generators.append(generator)
+            self._active_streams.append(alias)
+
+    async def stop(self) -> None:
+        if not self._running:
+            return
+        self._running = False
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+        for gen in self._generators:
+            try:
+                await gen.aclose()  # type: ignore[attr-defined]
+            except AttributeError:
+                continue
+            except Exception:
+                continue
+        self._tasks.clear()
+        self._generators.clear()
+        self._active_streams.clear()
+
+    async def _consume_stream(self, name: str, generator: Any) -> None:
+        try:
+            async for message in generator:
+                normalized = self._message_to_dict(message)
+                payload = {
+                    "timestamp": time.time(),
+                    "data": normalized,
+                }
+                self._on_stream_update(name, payload)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"[WARN] Telemetry stream '{name}' terminated: {exc}")
+
+    @classmethod
+    def _message_to_dict(cls, message: Any) -> Any:
+        return cls._normalize(message)
+
+    @classmethod
+    def _normalize(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, (np.floating, np.integer)):
+            return value.item()
+        if isinstance(value, Enum):
+            return value.name
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (list, tuple, set)):
+            return [cls._normalize(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): cls._normalize(v) for k, v in value.items()}
+        if hasattr(value, "_asdict"):
+            return {k: cls._normalize(v) for k, v in value._asdict().items()}
+        if hasattr(value, "__slots__"):
+            result: Dict[str, Any] = {}
+            for slot in value.__slots__:
+                if slot.startswith("_"):
+                    continue
+                try:
+                    slot_value = getattr(value, slot)
+                except AttributeError:
+                    continue
+                result[slot] = cls._normalize(slot_value)
+            if result:
+                return result
+        attrs: Dict[str, Any] = {}
+        if hasattr(value, "__dict__"):
+            for key, val in value.__dict__.items():
+                if key.startswith("_"):
+                    continue
+                attrs[key] = cls._normalize(val)
+            if attrs:
+                return attrs
+        # Fallback: inspect dir for simple attributes
+        dynamic: Dict[str, Any] = {}
+        for attr in dir(value):
+            if attr.startswith("_"):
+                continue
+            try:
+                attr_val = getattr(value, attr)
+            except AttributeError:
+                continue
+            if callable(attr_val):
+                continue
+            dynamic[attr] = cls._normalize(attr_val)
+        if dynamic:
+            return dynamic
+        return str(value)
+
+    def inject_sample(self, stream_name: str, payload: Dict[str, Any]) -> None:
+        """
+        Helper for tests: bypass MAVSDK and push a telemetry sample directly.
+        """
+        self._on_stream_update(stream_name, {"timestamp": time.time(), "data": payload})
+
+
 # ------------------ MagpieEnv ------------------
 
 class MagpieEnv:
@@ -53,6 +335,7 @@ class MagpieEnv:
 
         self.position_xyz = np.zeros(3, dtype=float)
         self.velocity_xyz = np.zeros(3, dtype=float)
+        self.on_state_update: Optional[Callable[[np.ndarray, np.ndarray], None]] = None
 
     # ---------- frame transforms ----------
 
@@ -111,6 +394,8 @@ class MagpieEnv:
         pos_ned, vel_ned = await self._read_telemetry_once()
         self.position_xyz = self.ned_to_xyz(pos_ned)
         self.velocity_xyz = self.ned_to_xyz_velocity(vel_ned)
+        if self.on_state_update is not None:
+            self.on_state_update(self.position_xyz.copy(), self.velocity_xyz.copy())
 
     async def compute_offset(self) -> None:
         await self.update_state()
@@ -203,7 +488,8 @@ class DroneAPI:
         await drone.follow_waypoints()
     """
 
-    def __init__(self,
+    def __init__(
+        self,
         system_address: str = "udp://:14540",
         control_rate_hz: float = 10.0,
         default_interpolation: Type[BaseInterpolation] = Linear,
@@ -212,7 +498,12 @@ class DroneAPI:
         *,
         log_enabled: bool = False,
         log_path: Optional[str] = None,
-        segment_timeout_sec: float = 25.0,      # <--- NEW
+        segment_timeout_sec: float = 25.0,
+        ros2_enabled: bool = False,
+        ros2_topic: str = "/magpie/raw_telemetry",
+        ros2_node_name: str = "magpie_raw_stream",
+        ros2_qos_depth: int = 10,
+        ros2_publisher_factory: Optional[Callable[[str, str, int], _BaseStatePublisher]] = None,
     ):
         self.system_address = system_address
         self.env = MagpieEnv(control_rate_hz=control_rate_hz)
@@ -220,6 +511,7 @@ class DroneAPI:
         self.default_interpolation_cls = default_interpolation
         self.max_speed = float(max_speed_m_s)
         self.use_velocity_command = bool(use_velocity_command)
+        self.env.on_state_update = self._on_env_state_update
 
         self._waypoint_queue: Deque[Waypoint] = deque()
         self._current_yaw = 0.0
@@ -227,12 +519,27 @@ class DroneAPI:
         
         self._segment_timeout_sec = float(segment_timeout_sec)
 
+        # ---- ROS2 + telemetry ----
+        self.ros2_enabled = bool(ros2_enabled)
+        self.ros2_topic = ros2_topic
+        self._ros2_node_name = ros2_node_name
+        self._ros2_qos_depth = int(ros2_qos_depth)
+        self._ros2_factory = ros2_publisher_factory
+        self._ros2_publisher: Optional[_BaseStatePublisher] = None
+        self._last_snapshot: Dict[str, Any] = {}
+        self._latest_telemetry: Dict[str, Dict[str, Any]] = {}
+        self._telemetry_streams_started: List[str] = []
+        self._telemetry_collector: Optional[TelemetryCollector] = None
+
         # ---- logging state ----
         self.log_enabled = bool(log_enabled)
         self.log_path = log_path or "flight_log.png"
         self._mission_start = 0.0
         self.telemetry_log: List[Dict[str, np.ndarray]] = []
         self.goal_history: List[np.ndarray] = []
+
+        self._setup_ros2_publisher()
+        self._publish_state_snapshot(trigger="init")
     
     @staticmethod
     def _movement_intersects_sphere(a: np.ndarray, b: np.ndarray, center: np.ndarray, radius: float) -> bool:
@@ -243,6 +550,172 @@ class DroneAPI:
         t = float(np.clip(np.dot(center - a, ab) / ab2, 0.0, 1.0))
         closest = a + t * ab
         return float(np.linalg.norm(closest - center)) <= radius
+
+    # ---------- telemetry + ROS helpers ----------
+
+    def _setup_ros2_publisher(self) -> None:
+        if not self.ros2_enabled or self._ros2_publisher is not None:
+            return
+        factory = self._ros2_factory or _Ros2StatePublisher
+        try:
+            self._ros2_publisher = factory(self.ros2_topic, self._ros2_node_name, self._ros2_qos_depth)
+        except Exception as exc:
+            print(f"[WARN] Unable to initialize ROS2 publisher: {exc}")
+            self._ros2_publisher = None
+
+    def _teardown_ros2_publisher(self) -> None:
+        if self._ros2_publisher is None:
+            return
+        try:
+            self._ros2_publisher.close()
+        except Exception:
+            pass
+        finally:
+            self._ros2_publisher = None
+
+    async def _start_telemetry_collector(self) -> None:
+        if self._telemetry_collector is None:
+            self._telemetry_collector = TelemetryCollector(self.env.drone, self._handle_telemetry_update)
+        await self._telemetry_collector.start()
+        self._telemetry_streams_started = self._telemetry_collector.active_streams
+        self._publish_state_snapshot(trigger="telemetry_streams_started", extra={"streams": self._telemetry_streams_started})
+
+    async def _stop_telemetry_collector(self) -> None:
+        if self._telemetry_collector is None:
+            return
+        await self._telemetry_collector.stop()
+        self._telemetry_streams_started = []
+
+    def _on_env_state_update(self, position_xyz: np.ndarray, velocity_xyz: np.ndarray) -> None:
+        data = {
+            "position_xyz": position_xyz.tolist(),
+            "velocity_xyz": velocity_xyz.tolist(),
+        }
+        self._handle_telemetry_update("magpie_env_local_state", {"timestamp": time.time(), "data": data})
+
+    def _handle_telemetry_update(self, stream_name: str, payload: Dict[str, Any]) -> None:
+        self._latest_telemetry[stream_name] = payload
+        self._publish_state_snapshot(
+            trigger=f"telemetry_update:{stream_name}",
+            extra={"stream": stream_name, "payload": payload["data"]},
+        )
+
+    @staticmethod
+    def _snapshot_value(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, (np.floating, np.integer)):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, list):
+            return [DroneAPI._snapshot_value(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): DroneAPI._snapshot_value(v) for k, v in value.items()}
+        if hasattr(value, "__slots__"):
+            out: Dict[str, Any] = {}
+            for slot in value.__slots__:
+                if slot.startswith("_"):
+                    continue
+                try:
+                    out[slot] = DroneAPI._snapshot_value(getattr(value, slot))
+                except AttributeError:
+                    continue
+            if out:
+                return out
+        if hasattr(value, "__dict__"):
+            return {k: DroneAPI._snapshot_value(v) for k, v in value.__dict__.items() if not k.startswith("_")}
+        return str(value)
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        if isinstance(value, (np.ndarray,)):
+            return value.tolist()
+        if isinstance(value, (np.floating, np.integer)):
+            return value.item()
+        if isinstance(value, (Enum,)):
+            return value.name
+        return DroneAPI._snapshot_value(value)
+
+    def _collect_state_snapshot(self, trigger: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        now = time.time()
+        env = self.env
+        queue_serialized = [self._snapshot_value(wp) for wp in self._waypoint_queue]
+
+        telemetry_buffer = [
+            {key: self._snapshot_value(val) for key, val in sample.items()}
+            for sample in self.telemetry_log
+        ]
+
+        snapshot: Dict[str, Any] = {
+            "timestamp": now,
+            "trigger": trigger,
+            "system_address": self.system_address,
+            "mission": {
+                "started": self._mission_started,
+                "current_yaw_deg": self._current_yaw,
+                "segment_timeout_sec": self._segment_timeout_sec,
+                "max_speed_m_s": self.max_speed,
+                "use_velocity_command": self.use_velocity_command,
+                "default_interpolation": self.default_interpolation_cls.__name__,
+                "waypoint_queue_length": len(self._waypoint_queue),
+            },
+            "environment": {
+                "control_rate_hz": env.control_rate_hz,
+                "control_dt": env.control_dt,
+                "offset_ready": env.offset_ready,
+                "offset_xyz": self._snapshot_value(env.offset_xyz),
+                "position_xyz": self._snapshot_value(env.position_xyz),
+                "velocity_xyz": self._snapshot_value(env.velocity_xyz),
+            },
+            "waypoints": queue_serialized,
+            "goal_history": [self._snapshot_value(goal) for goal in self.goal_history],
+            "logging": {
+                "enabled": self.log_enabled,
+                "log_path": self.log_path,
+                "buffer_length": len(self.telemetry_log),
+                "telemetry_samples": telemetry_buffer,
+            },
+            "telemetry_raw": {
+                "streams_active": list(self._telemetry_streams_started),
+                "streams": {
+                    name: {
+                        "timestamp": data.get("timestamp"),
+                        "data": self._snapshot_value(data.get("data")),
+                    }
+                    for name, data in self._latest_telemetry.items()
+                },
+            },
+        }
+        if extra is not None:
+            snapshot["extra"] = extra
+        return snapshot
+
+    def _publish_state_snapshot(self, *, trigger: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        snapshot = self._collect_state_snapshot(trigger, extra)
+        self._last_snapshot = snapshot
+        if self._ros2_publisher is not None:
+            try:
+                payload = json.dumps(snapshot, default=self._json_default, sort_keys=False)
+                self._ros2_publisher.publish(payload)
+            except Exception as exc:
+                print(f"[WARN] Failed to publish ROS2 snapshot: {exc}")
+        return snapshot
+
+    def publish_state_snapshot(self, trigger: str = "manual", extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Public helper to push the current snapshot (used by test/demo scripts)."""
+        return self._publish_state_snapshot(trigger=trigger, extra=extra)
+
+    def get_last_state_snapshot(self) -> Dict[str, Any]:
+        return self._last_snapshot.copy()
+
+    def ingest_telemetry_sample(self, stream_name: str, payload: Dict[str, Any]) -> None:
+        """
+        Testing hook: push a telemetry payload directly (bypasses MAVSDK collectors).
+        """
+        self._handle_telemetry_update(stream_name, {"timestamp": time.time(), "data": payload})
 
     # ---------- mission lifecycle ----------
 
@@ -264,6 +737,8 @@ class DroneAPI:
                 print("-- Global position estimate OK")
                 break
 
+        await self._start_telemetry_collector()
+
         await self.env.turn_off_offboard()
         await self.env.arm()
         await self.env.takeoff_to_altitude(altitude=initial_altitude, yaw=yaw)
@@ -273,6 +748,7 @@ class DroneAPI:
             self.start_logging()
 
         self._mission_started = True
+        self._publish_state_snapshot(trigger="begin_mission_complete")
 
     async def end_mission(self) -> None:
         await self.env.simple_land()
@@ -280,10 +756,14 @@ class DroneAPI:
         await self.env.turn_off_offboard()
         if self.log_enabled:
             self.save_flight_plot(self.log_path)
+        self._publish_state_snapshot(trigger="end_mission_complete")
 
     async def shutdown(self) -> None:
         await self.env.turn_off_offboard()
         await self.env.disarm()
+        await self._stop_telemetry_collector()
+        self._publish_state_snapshot(trigger="shutdown")
+        self._teardown_ros2_publisher()
 
     # ---------- queue management ----------
 
@@ -428,11 +908,13 @@ class DroneAPI:
         self.telemetry_log.clear()
         self.goal_history.clear()
         self._mission_start = time.time()
+        self._publish_state_snapshot(trigger="start_logging")
 
     def end_logging(self) -> None:
         self.telemetry_log.clear()
         self.goal_history.clear()
         self._mission_start = 0.0
+        self._publish_state_snapshot(trigger="end_logging")
 
     def save_flight_plot(self, path: Optional[str] = None) -> Optional[str]:
         if not self.log_enabled or len(self.telemetry_log) < 2:
@@ -607,4 +1089,5 @@ class DroneAPI:
         self.end_logging()
 
         print(f"-- Saved flight log plot to {path}")
+        self._publish_state_snapshot(trigger="save_flight_plot", extra={"path": path})
         return path

@@ -1,83 +1,131 @@
-# DroneAPI Reference
+# DroneAPI Guide
 
-`DroneAPI` wraps MAVSDK offboard control with a tiny movement queue, multiple interpolation profiles, and optional telemetry logging. Everything lives in `drone_env_modular.py`.
+`DroneAPI` (defined in `magpie.py`) is the high-level mission wrapper that MAGPIE uses to fly MAVSDK-compatible vehicles with queued waypoints, pluggable interpolation strategies, and optional telemetry logging. This guide walks through the lifecycle, explains the coordinate frame, and demonstrates idiomatic usage pulled directly from `magpie.py` and `test_demo.py`.
 
-## Quick Example
+## Repository Tour
+- `magpie.py` – exposes `DroneAPI`, the `MagpieEnv` helper, and logging utilities.
+- `interpolation.py` – interpolation strategies (`Linear`, `Cubic`, `Bezier`, `BarrelTowards`, `TrapezoidalVelocity`, `L1Guidance`, …).
+- `test_demo.py` – end-to-end async demos that exercise multiple interpolations and shapes.
+- `SetupGuide.md` / `FromScratchSetup.md` – environment preparation and MAVSDK notes.
+
+## Coordinate Frame & Assumptions
+`MagpieEnv` keeps motion in a local XYZ frame:
+- x → East, y → Up, z → North.
+- Yaw is expressed in degrees around the up axis.
+- `begin_mission()` samples the current position to build the offset, so all waypoints and telemetry are relative to the takeoff location.
+
+## Mission Lifecycle At A Glance
+1. Instantiate `DroneAPI`, choosing defaults (connection URL, interpolation, max speed, logging).
+2. `await begin_mission(initial_altitude, yaw)` – connect, verify health, arm, take off, optionally start logging.
+3. Populate the waypoint queue with `enqueue_waypoint(...)`.
+4. `await follow_waypoints()` to fly the queue (repeatable; queue can be refilled on the fly).
+5. `await end_mission()` to land and save logs.
+6. `await shutdown()` for hard cleanup (ensures offboard is stopped and motors are disarmed).
+
+All motion commands require `begin_mission()` first so the local frame and offboard session are ready.
+
+## Quickstart Mission
+
 ```python
 import asyncio
-from drone_env_modular import DroneAPI
 
-async def mission():
-    drone = DroneAPI(system_address="udp://:14540", log_enabled=True)
+from DroneAPI.magpie import DroneAPI
+from DroneAPI.interpolation import L1Guidance, Cubic
+
+
+async def main():
+    drone = DroneAPI(
+        system_address="udp://:14540",
+        default_interpolation=L1Guidance,   # pass-through profile
+        max_speed_m_s=1.8,
+        log_enabled=True,
+        log_path="logs/figure8.png",
+        segment_timeout_sec=25.0,
+    )
+
     await drone.begin_mission(initial_altitude=3.0, yaw=0.0)
 
-    drone.enqueue_waypoint(1.0, 3.0, 4.0, yaw=10.0)
-    drone.enqueue_waypoint(0.0, 4.0, 2.0, yaw=0.0, interpolation="precision")
+    # Enqueue a figure-eight pattern; override the third segment to stop at the goal
+    drone.enqueue_waypoint(2.0, 3.0, 0.0, yaw=90.0)
+    drone.enqueue_waypoint(-2.0, 3.0, 0.0, yaw=270.0)
+    drone.enqueue_waypoint(0.0, 3.0, 2.0, yaw=0.0, interpolation=Cubic, threshold=0.12)
+
     await drone.follow_waypoints()
 
-    await drone.goto(0.0, 3.0, 0.0)
-    await drone.end_mission()
-    # Logging automatically saves when end_mission finishes.
+    # Return home and land with a stop-style interpolation
+    drone.enqueue_waypoint(0.0, 3.0, 0.0, yaw=0.0, interpolation=Cubic)
+    drone.enqueue_waypoint(0.0, 0.0, 0.0, yaw=0.0, interpolation=Cubic, threshold=0.1)
+    await drone.follow_waypoints()
 
-asyncio.run(mission())
+    await drone.end_mission()
+    await drone.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-## Lifecycle
-- `await begin_mission(initial_altitude=2.0, yaw=0.0)`  
-  Connects to the vehicle, waits for healthy telemetry, arms, climbs to the requested altitude, and (when `log_enabled=True`) starts a fresh logging session.
-- `await end_mission()`  
-  Commands a land, waits for touchdown, turns off offboard, and auto-saves the current flight plot if logging is active.
-- `await shutdown()`  
-  Emergency-safe cleanup: ensures offboard is stopped and the vehicle is disarmed.
+### What the Example Highlights
+- `system_address` is the MAVSDK connection string; adjust for your transport.
+- `default_interpolation` defines how pass-through segments behave; override per waypoint when needed.
+- Each waypoint uses local-frame coordinates (meters relative to takeoff).
+- The per-waypoint `threshold` controls the completion radius (defaults to `0.15` m).
+- `segment_timeout_sec` guards against a stuck interpolation by forcing completion after the watchdog expires.
 
-## Movement & Queue
-- `await goto(x, y, z, yaw=0.0, interpolation=None)`  
-  Sends the drone to a single XYZ target (local frame) using the selected interpolation. Passing `interpolation=None` uses the `default_interpolation` from the constructor.
-- `enqueue_waypoint(x, y, z, yaw=0.0, interpolation=None)` / `clear_waypoints()`  
-  Push or reset the queued track. Each waypoint may override the interpolation mode.
+## Managing the Waypoint Queue
+- `enqueue_waypoint(x, y, z, yaw=0.0, interpolation=None, threshold=None)`  
+  Adds a segment to the queue. Provide an interpolation class from `interpolation.py` to override the default, and optionally tighten/loosen the completion tolerance.
 - `await follow_waypoints(wait_for_new=False, idle_sleep=0.25)`  
-  Consumes the queue in order. Set `wait_for_new=True` to keep the worker alive until `stop_waiting_for_waypoints()` is called.
-- `stop_waiting_for_waypoints()`  
-  Signals a waiting worker to finish when `wait_for_new=True`.
-- `available_interpolations()`  
-  Returns the list of supported interpolation keywords.
+  Consumes the queue until empty. Set `wait_for_new=True` to keep the worker alive; the method will idle until new waypoints arrive, which is useful when another task feeds the queue opportunistically.
+- `clear_waypoints()`  
+  Drops any queued-but-unflown segments (safe to call mid-mission before `follow_waypoints()` is awaited again).
 
-All movement commands require that `begin_mission()` has already been awaited so the local reference frame is known.
+Because `follow_waypoints` is awaited, you decide how to sequence the mission: either enqueue everything at once, or stream waypoints while the worker loops with `wait_for_new=True`.
 
-## Interpolation Modes
-- `linear` – straight-line position samples with constant-speed velocity targets.
-- `cubic` – clamped cubic splines (zero velocity at endpoints) for smooth arrivals.
-- `minimum_jerk` – quintic easing curve for gradual acceleration and deceleration.
-- `precision` – repeatedly reissues a position hold on the current goal, waiting until the drone is both within `precision_tolerance` and almost stationary before releasing the next waypoint. Ideal when you need simple, stop-on-target behavior.
+### Guarding Individual Segments
+`DroneAPI` exposes `segment_timeout_sec` (default `25` s). When the watchdog fires, the current interpolation is forced to finish and the next waypoint begins. For higher-level control, wrap `follow_waypoints()` in `asyncio.wait_for`, as shown in `test_demo.py`, to fail fast if a specific segment takes too long:
 
-Change the default with `default_interpolation` in the constructor or per-call via the `interpolation` argument.
+```python
+await asyncio.wait_for(drone.follow_waypoints(), timeout=20.0)
+```
 
-### Precision Parameters
-The constructor exposes two tuning knobs:
-- `precision_tolerance` (meters, default `0.1`) – distance required before the next waypoint is released.
-- `precision_timeout_sec` (default `20.0`) – safety cap on how long the precision controller will try before emitting a warning and moving on.
-- The controller also waits for the speed to fall below roughly `0.05 m/s` before advancing, so the vehicle settles on each target.
+## Choosing an Interpolation Profile
+Import from `DroneAPI.interpolation`. Every class delivers positions (and optionally velocities) to MAVSDK’s offboard interface:
+
+- `Linear` – straight-line pass-through, constant-speed velocity hints, minimal overshoot guard.
+- `Bezier` – quadratic Bézier for smoother arcs between waypoints, still pass-through aware.
+- `BarrelTowards` – constant-speed bias with cross-track damping; good for aggressive tracking.
+- `L1Guidance` – pure-pursuit style controller tuned for reliable pass-through and endgame handling; a solid default for continuous paths.
+- `Cubic` – ease-in/ease-out profile that comes to a full stop at the goal, ideal for precise holds.
+- `TrapezoidalVelocity` – stop-at-goal with explicit accel/cruise/decel shaping.
+
+Set the mission-wide default via the constructor (`default_interpolation`) and override per waypoint with the `interpolation` argument. All interpolations respect `max_speed_m_s` and the per-waypoint `threshold`.
 
 ## Logging & Flight Plots
-- Pass `log_enabled=True` (and optionally `log_path="flight_log.png"`) to record telemetry.
-- Logging starts automatically inside `begin_mission()`; you can also call `start_logging()` manually for ad-hoc sessions.
-- After a mission, call `save_flight_plot(path=None)` to emit a diagnostic PNG with:
-  - top-down x–z path with goal markers,
-  - x/z/y vs. time traces,
-  - velocity components and total speed,
-  - distance-to-active-goal vs. time.
-  The routine clears the buffered log (`end_logging()`) so the next session begins clean.
+Enable logging by passing `log_enabled=True`. Once enabled:
+- `begin_mission()` automatically calls `start_logging()`; `end_mission()` saves and clears the log via `save_flight_plot(log_path)`.
+- `save_flight_plot()` builds a PNG summarizing the XY path, altitude, velocities, accelerations, and distance-to-goal traces.
+- Call `start_logging()` / `end_logging()` manually if you need custom recording windows while the mission runs.
 
-## Configuration Helpers
-- `set_max_speed(value)` – updates the maximum interpolation speed (affects all modes).
-- `set_velocity_ramp(seconds)` – adjusts the soft-start ramp that scales the initial velocity commands.
-- `set_velocity_command` (constructor flag) – disable velocity setpoints to issue position-only commands if your vehicle prefers it.
+The logging buffer only persists for the active mission. A successful save prints `-- Saved flight log plot to ...`.
 
-## Demo Scenarios
-`python drone_env_modular.py` runs four back-to-back demo missions (linear, cubic, minimum_jerk, precision). Each:
-1. Takes off to 3 m.
-2. Generates a random track of waypoints with the chosen interpolation.
-3. Commands a precise return to `(0, altitude, 0)` and then a gentle descent toward `(0, 0.5, 0)`.
-4. Lands, disarms, and saves a log image (`demo_<mode>_flight.png`).
+## Cleanup Patterns
+- Always follow `end_mission()` with `shutdown()` if your script exits immediately. `end_mission()` handles landing and log persistence; `shutdown()` guarantees offboard is stopped and the vehicle is disarmed even if an exception occurred.
+- In error handlers where the mission never started, call `await drone.shutdown()` to leave the system safe.
 
-Use the demo output to compare interpolation styles and verify the logging pipeline end-to-end.
+## Putting It Together: Demos & Tests
+`test_demo.py` demonstrates more advanced patterns:
+- Builds reusable waypoint generators (square, circle, dense spline, 3D star).
+- Iterates over interpolation classes, instantiating `DroneAPI` for each mission run.
+- Wraps every `follow_waypoints()` call in `asyncio.wait_for` to enforce per-segment timeouts.
+- Uses `Cubic` for the “return home and land” sequence so the drone stops before descending.
+
+Use the demo as a template when you need to batch missions, compare interpolations, or integrate with ROS2 (`main()` calls `asyncio.run` to stay compatible with synchronous entry points).
+
+## Troubleshooting Checklist
+- Stuck before takeoff → confirm MAVSDK connection string and that hardening scripts (See `SetupGuide.md`) were followed.
+- Vehicle drifts off path → try `L1Guidance` or `TrapezoidalVelocity`, or reduce `max_speed_m_s`.
+- Logs not saved → ensure `log_enabled=True` and call `end_mission()`; the plot is emitted during the landing cleanup.
+- Need to abort mid-flight → `await drone.shutdown()` stops offboard and disarms immediately.
+
+With these patterns, `DroneAPI` becomes a predictable building block for structured missions and research experiments.

@@ -173,6 +173,7 @@ async def _async_main():
                 use_velocity_command=True,
                 log_enabled=True,
                 log_path=f"/media/sf_Testing/{name_interp}_{name_scn}.png",
+                telemetry_publish_interval=0.3,
                 **ros_kwargs,
             )
 

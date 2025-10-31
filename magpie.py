@@ -69,7 +69,6 @@ class _Ros2StatePublisher(_BaseStatePublisher):
 
         self._rclpy = rclpy
         self._String = String
-        self._executor = SingleThreadedExecutor()
         self._lock = threading.Lock()
         self._topic = topic
         self._running = threading.Event()
@@ -80,6 +79,7 @@ class _Ros2StatePublisher(_BaseStatePublisher):
             self._rclpy.init(args=None)
             self._owns_context = True
 
+        self._executor = SingleThreadedExecutor()
         self._node = Node(node_name)
         self._publisher = self._node.create_publisher(String, topic, qos_depth)
         self._executor.add_node(self._node)
@@ -504,6 +504,7 @@ class DroneAPI:
         ros2_node_name: str = "magpie_raw_stream",
         ros2_qos_depth: int = 10,
         ros2_publisher_factory: Optional[Callable[[str, str, int], _BaseStatePublisher]] = None,
+        telemetry_publish_interval: float = 0.25,
     ):
         self.system_address = system_address
         self.env = MagpieEnv(control_rate_hz=control_rate_hz)
@@ -530,6 +531,11 @@ class DroneAPI:
         self._latest_telemetry: Dict[str, Dict[str, Any]] = {}
         self._telemetry_streams_started: List[str] = []
         self._telemetry_collector: Optional[TelemetryCollector] = None
+        self._telemetry_publish_interval = max(0.0, float(telemetry_publish_interval))
+        self._last_snapshot_time = 0.0
+        self._snapshot_dirty = True
+        self._pending_trigger: Optional[str] = None
+        self._pending_extra: Optional[Dict[str, Any]] = None
 
         # ---- logging state ----
         self.log_enabled = bool(log_enabled)
@@ -539,7 +545,7 @@ class DroneAPI:
         self.goal_history: List[np.ndarray] = []
 
         self._setup_ros2_publisher()
-        self._publish_state_snapshot(trigger="init")
+        self._publish_state_snapshot(trigger="init", force=True)
     
     @staticmethod
     def _movement_intersects_sphere(a: np.ndarray, b: np.ndarray, center: np.ndarray, radius: float) -> bool:
@@ -576,9 +582,19 @@ class DroneAPI:
     async def _start_telemetry_collector(self) -> None:
         if self._telemetry_collector is None:
             self._telemetry_collector = TelemetryCollector(self.env.drone, self._handle_telemetry_update)
-        await self._telemetry_collector.start()
+        try:
+            await self._telemetry_collector.start()
+        except Exception as exc:
+            print(f"[WARN] Telemetry collector failed to start: {exc}")
+            self._telemetry_collector = None
+            self._telemetry_streams_started = []
+            return
         self._telemetry_streams_started = self._telemetry_collector.active_streams
-        self._publish_state_snapshot(trigger="telemetry_streams_started", extra={"streams": self._telemetry_streams_started})
+        self._publish_state_snapshot(
+            trigger="telemetry_streams_started",
+            extra={"streams": self._telemetry_streams_started},
+            force=True,
+        )
 
     async def _stop_telemetry_collector(self) -> None:
         if self._telemetry_collector is None:
@@ -595,9 +611,11 @@ class DroneAPI:
 
     def _handle_telemetry_update(self, stream_name: str, payload: Dict[str, Any]) -> None:
         self._latest_telemetry[stream_name] = payload
+        self._snapshot_dirty = True
         self._publish_state_snapshot(
             trigger=f"telemetry_update:{stream_name}",
-            extra={"stream": stream_name, "payload": payload["data"]},
+            extra={"stream": stream_name},
+            force=False,
         )
 
     @staticmethod
@@ -644,10 +662,10 @@ class DroneAPI:
         env = self.env
         queue_serialized = [self._snapshot_value(wp) for wp in self._waypoint_queue]
 
-        telemetry_buffer = [
-            {key: self._snapshot_value(val) for key, val in sample.items()}
-            for sample in self.telemetry_log
-        ]
+        last_sample = (
+            {key: self._snapshot_value(val) for key, val in self.telemetry_log[-1].items()}
+            if self.telemetry_log else None
+        )
 
         snapshot: Dict[str, Any] = {
             "timestamp": now,
@@ -676,7 +694,7 @@ class DroneAPI:
                 "enabled": self.log_enabled,
                 "log_path": self.log_path,
                 "buffer_length": len(self.telemetry_log),
-                "telemetry_samples": telemetry_buffer,
+                "last_sample": last_sample,
             },
             "telemetry_raw": {
                 "streams_active": list(self._telemetry_streams_started),
@@ -693,9 +711,35 @@ class DroneAPI:
             snapshot["extra"] = extra
         return snapshot
 
-    def _publish_state_snapshot(self, *, trigger: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        snapshot = self._collect_state_snapshot(trigger, extra)
+    def _publish_state_snapshot(
+        self,
+        *,
+        trigger: str,
+        extra: Optional[Dict[str, Any]] = None,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        self._pending_trigger = trigger
+        self._pending_extra = extra
+        now = time.time()
+
+        if not force:
+            if not self._snapshot_dirty:
+                return self._last_snapshot
+            if (
+                self._telemetry_publish_interval > 0.0
+                and (now - self._last_snapshot_time) < self._telemetry_publish_interval
+            ):
+                return self._last_snapshot
+
+        actual_trigger = self._pending_trigger or trigger
+        actual_extra = self._pending_extra
+        snapshot = self._collect_state_snapshot(actual_trigger, actual_extra)
         self._last_snapshot = snapshot
+        self._last_snapshot_time = now
+        self._snapshot_dirty = False
+        self._pending_trigger = None
+        self._pending_extra = None
+
         if self._ros2_publisher is not None:
             try:
                 payload = json.dumps(snapshot, default=self._json_default, sort_keys=False)
@@ -704,9 +748,15 @@ class DroneAPI:
                 print(f"[WARN] Failed to publish ROS2 snapshot: {exc}")
         return snapshot
 
-    def publish_state_snapshot(self, trigger: str = "manual", extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Public helper to push the current snapshot (used by test/demo scripts)."""
-        return self._publish_state_snapshot(trigger=trigger, extra=extra)
+    def publish_state_snapshot(
+        self,
+        trigger: str = "manual",
+        extra: Optional[Dict[str, Any]] = None,
+        *,
+        force: bool = True,
+    ) -> Dict[str, Any]:
+        """Public helper to push the current snapshot (used by test/demo/test harness scripts)."""
+        return self._publish_state_snapshot(trigger=trigger, extra=extra, force=force)
 
     def get_last_state_snapshot(self) -> Dict[str, Any]:
         return self._last_snapshot.copy()
@@ -748,7 +798,7 @@ class DroneAPI:
             self.start_logging()
 
         self._mission_started = True
-        self._publish_state_snapshot(trigger="begin_mission_complete")
+        self._publish_state_snapshot(trigger="begin_mission_complete", force=True)
 
     async def end_mission(self) -> None:
         await self.env.simple_land()
@@ -756,14 +806,22 @@ class DroneAPI:
         await self.env.turn_off_offboard()
         if self.log_enabled:
             self.save_flight_plot(self.log_path)
-        self._publish_state_snapshot(trigger="end_mission_complete")
+        self._publish_state_snapshot(trigger="end_mission_complete", force=True)
 
     async def shutdown(self) -> None:
         await self.env.turn_off_offboard()
         await self.env.disarm()
         await self._stop_telemetry_collector()
-        self._publish_state_snapshot(trigger="shutdown")
+        self._publish_state_snapshot(trigger="shutdown", force=True)
         self._teardown_ros2_publisher()
+        close_method = getattr(self.env.drone, "close", None)
+        if close_method is not None:
+            try:
+                result = close_method()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
 
     # ---------- queue management ----------
 
@@ -772,16 +830,32 @@ class DroneAPI:
         interpolation: Optional[Type[BaseInterpolation]] = None,
         threshold: Optional[float] = None,
     ) -> None:
-        self._waypoint_queue.append(
-            Waypoint(
-                x=float(x), y=float(y), z=float(z), yaw=float(yaw),   # <- fixed
-                interpolation=interpolation,
-                threshold=float(threshold) if threshold is not None else 0.15,
-            )
+        waypoint = Waypoint(
+            x=float(x), y=float(y), z=float(z), yaw=float(yaw),
+            interpolation=interpolation,
+            threshold=float(threshold) if threshold is not None else 0.15,
+        )
+        self._waypoint_queue.append(waypoint)
+        self._snapshot_dirty = True
+        self._publish_state_snapshot(
+            trigger="enqueue_waypoint",
+            extra={
+                "queued_waypoint": {
+                    "x": waypoint.x,
+                    "y": waypoint.y,
+                    "z": waypoint.z,
+                    "yaw": waypoint.yaw,
+                    "threshold": waypoint.threshold,
+                    "interpolation": waypoint.interpolation.__name__ if waypoint.interpolation else None,
+                }
+            },
+            force=False,
         )
 
     def clear_waypoints(self) -> None:
         self._waypoint_queue.clear()
+        self._snapshot_dirty = True
+        self._publish_state_snapshot(trigger="clear_waypoints", force=False)
 
     # ---------- movement loop with interpolation ----------
 
@@ -815,6 +889,7 @@ class DroneAPI:
         target_yaw = float(wp.yaw)
         if self.log_enabled:
             self.goal_history.append(target_local.copy())
+            self._snapshot_dirty = True
 
         # Build context for interpolation
         ctx = InterpContext(
@@ -838,6 +913,7 @@ class DroneAPI:
         # Prime logging (initial sample)
         if self.log_enabled:
             self.telemetry_log.append(self._make_log_sample(target_local=target_local))
+            self._snapshot_dirty = True
 
         prev_pos = start_pos.copy()
         t0 = time.time()
@@ -865,6 +941,7 @@ class DroneAPI:
             # log a sample each tick
             if self.log_enabled:
                 self.telemetry_log.append(self._make_log_sample(target_local=target_local))
+                self._snapshot_dirty = True
 
             # --------- robust completion guards ----------
             # 1) if I'm simply inside the sphere, count it as done
@@ -908,13 +985,13 @@ class DroneAPI:
         self.telemetry_log.clear()
         self.goal_history.clear()
         self._mission_start = time.time()
-        self._publish_state_snapshot(trigger="start_logging")
+        self._publish_state_snapshot(trigger="start_logging", force=True)
 
     def end_logging(self) -> None:
         self.telemetry_log.clear()
         self.goal_history.clear()
         self._mission_start = 0.0
-        self._publish_state_snapshot(trigger="end_logging")
+        self._publish_state_snapshot(trigger="end_logging", force=True)
 
     def save_flight_plot(self, path: Optional[str] = None) -> Optional[str]:
         if not self.log_enabled or len(self.telemetry_log) < 2:
@@ -1089,5 +1166,5 @@ class DroneAPI:
         self.end_logging()
 
         print(f"-- Saved flight log plot to {path}")
-        self._publish_state_snapshot(trigger="save_flight_plot", extra={"path": path})
+        self._publish_state_snapshot(trigger="save_flight_plot", extra={"path": path}, force=True)
         return path

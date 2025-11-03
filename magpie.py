@@ -7,7 +7,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
@@ -140,56 +140,60 @@ class _Ros2StatePublisher(_BaseStatePublisher):
 
 # ------------------ Telemetry collector ------------------
 
+ESSENTIAL_TELEMETRY_STREAMS: Tuple[str, ...] = (
+    "position",
+    "velocity_ned",
+    "position_velocity_ned",
+    "attitude_euler",
+    "attitude_quaternion",
+    "battery",
+    "health",
+    "health_all_ok",
+    "flight_mode",
+    "status_text",
+    "home",
+    "gps_info",
+    "raw_gps",
+    "in_air",
+    "landed_state",
+    "unix_epoch_time",
+)
+
+
 class TelemetryCollector:
     """
-    Subscribes to every available MAVSDK telemetry stream and forwards updates.
+    Subscribes to available MAVSDK telemetry streams and forwards updates.
     """
 
-    DEFAULT_STREAM_NAMES: Tuple[str, ...] = (
-        "position",
-        "home",
-        "position_velocity_ned",
-        "velocity_ned",
-        "ground_speed_ned",
-        "attitude_euler",
-        "attitude_quaternion",
-        "angular_velocity_body",
-        "linear_acceleration_body",
-        "imu",
-        "scaled_imu",
-        "raw_imu",
-        "magnetometer",
-        "gps_info",
-        "raw_gps",
-        "health",
-        "health_all_ok",
-        "battery",
-        "flight_mode",
-        "status_text",
-        "unix_epoch_time",
-        "distance_sensor",
-        "landed_state",
-        "in_air",
-        "odometry",
-        "fixedwing_metrics",
-        "actuator_control_target",
-        "actuator_output_status",
-        "rc_status",
-        "airspeed",
-        "heading",
-        "acceleration_ned",
-        "camera_attitude_euler",
-        "camera_attitude_quaternion",
-    )
+    DEFAULT_STREAM_NAMES: Tuple[str, ...] = ESSENTIAL_TELEMETRY_STREAMS
 
-    def __init__(self, system: System, on_stream_update: Callable[[str, Dict[str, Any]], None]):
+    def __init__(
+        self,
+        system: System,
+        on_stream_update: Callable[[str, Dict[str, Any]], None],
+        *,
+        stream_names: Optional[Sequence[str]] = None,
+        auto_discover: bool = False,
+    ):
         self._system = system
         self._on_stream_update = on_stream_update
         self._tasks: List[asyncio.Task] = []
         self._generators: List[Any] = []
         self._running = False
         self._active_streams: List[str] = []
-        self._stream_names: List[str] = self._discover_stream_names()
+        self._auto_discover = bool(auto_discover)
+        if stream_names is not None:
+            if isinstance(stream_names, (str, bytes)):
+                raise TypeError("stream_names must be a sequence, not a string")
+            sanitized = [str(name).strip() for name in stream_names if str(name).strip()]
+            if not sanitized:
+                raise ValueError("stream_names sequence must contain at least one value")
+            self._stream_names = sorted(set(sanitized))
+        else:
+            self._stream_names = list(self.DEFAULT_STREAM_NAMES)
+        if self._auto_discover:
+            self._stream_names = self._discover_stream_names()
+        self._closed_streams: set[str] = set()
 
     @property
     def active_streams(self) -> List[str]:
@@ -223,7 +227,10 @@ class TelemetryCollector:
             if required_params:
                 continue
 
-            if inspect.iscoroutinefunction(attr) or inspect.isasyncgenfunction(attr):
+            if inspect.iscoroutinefunction(attr):
+                # coroutines are usually single-shot getters; skip them
+                continue
+            if inspect.isasyncgenfunction(attr):
                 names.add(name)
                 continue
 
@@ -234,6 +241,10 @@ class TelemetryCollector:
 
         return sorted(names)
 
+    async def configure_rates(self, rate_hz: float) -> None:
+        # Many rate setters are unsupported depending on vehicle type; we leave rates untouched by default.
+        return None
+
     async def start(self) -> None:
         if self._running:
             return
@@ -242,10 +253,18 @@ class TelemetryCollector:
         self._generators.clear()
         self._active_streams.clear()
 
+        telemetry_obj = self._system.telemetry
         for name in self._stream_names:
-            attr = getattr(self._system.telemetry, name, None)
+            attr = getattr(telemetry_obj, name, None)
             if attr is None or not callable(attr):
                 continue
+
+            if not inspect.isasyncgenfunction(attr):
+                return_hint = getattr(attr, "__annotations__", {}).get("return")
+                hint_text = getattr(return_hint, "__name__", "") if return_hint else ""
+                if "AsyncGenerator" not in hint_text and "AsyncIterator" not in hint_text:
+                    continue
+
             try:
                 generator = attr()
             except TypeError:
@@ -292,7 +311,13 @@ class TelemetryCollector:
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            print(f"[WARN] Telemetry stream '{name}' terminated: {exc}")
+            text = str(exc)
+            if "grpc_status:14" in text or "Socket closed" in text:
+                if name not in self._closed_streams:
+                    print(f"[INFO] Telemetry stream '{name}' closed")
+                    self._closed_streams.add(name)
+            else:
+                print(f"[WARN] Telemetry stream '{name}' terminated: {exc}")
 
     @classmethod
     def _message_to_dict(cls, message: Any) -> Any:
@@ -503,9 +528,12 @@ class MagpieEnv:
         target_world = self.offset_xyz + np.array([0.0, altitude, 0.0], dtype=float)
 
         print("-- Taking off")
-        await self.command_position(target_world, yaw_deg=yaw)
-        await asyncio.sleep(0.5)
+        # Send a short burst of setpoints before entering offboard mode.
+        for _ in range(6):
+            await self.command_position(target_world, yaw_deg=yaw)
+            await asyncio.sleep(self.control_dt)
         await self.turn_on_offboard()
+        await asyncio.sleep(self.control_dt)
 
         climb_profile = np.array([0.0, -0.2, 0.0, 0.0], dtype=float)
         await self.command_position(target_world, yaw_deg=yaw, velocity_xyz_yaw=climb_profile)
@@ -547,7 +575,9 @@ class DroneAPI:
         ros2_node_name: str = "magpie_raw_stream",
         ros2_qos_depth: int = 10,
         ros2_publisher_factory: Optional[Callable[[str, str, int], _BaseStatePublisher]] = None,
-        telemetry_publish_interval: float = 0.25,
+        telemetry_stream_mode: Union[str, Sequence[str]] = "essential",
+        telemetry_rate_hz: float = 0.0,
+        telemetry_publish_interval: float = 1.0,
     ):
         self.system_address = system_address
         self.env = MagpieEnv(control_rate_hz=control_rate_hz)
@@ -574,6 +604,25 @@ class DroneAPI:
         self._latest_telemetry: Dict[str, Dict[str, Any]] = {}
         self._telemetry_streams_started: List[str] = []
         self._telemetry_collector: Optional[TelemetryCollector] = None
+
+        self._telemetry_rate_hz = max(0.0, float(telemetry_rate_hz))
+        self._telemetry_auto_discover = False
+        if isinstance(telemetry_stream_mode, str):
+            mode = telemetry_stream_mode.strip().lower()
+            if mode == "all":
+                self._telemetry_auto_discover = True
+                self._telemetry_stream_names = list(ESSENTIAL_TELEMETRY_STREAMS)
+            elif mode == "essential":
+                self._telemetry_stream_names = list(ESSENTIAL_TELEMETRY_STREAMS)
+            else:
+                raise ValueError("telemetry_stream_mode must be 'all', 'essential', or a sequence of stream names")
+        elif isinstance(telemetry_stream_mode, Sequence):
+            if not telemetry_stream_mode:
+                raise ValueError("telemetry_stream_mode sequence cannot be empty")
+            self._telemetry_stream_names = [str(name) for name in telemetry_stream_mode]
+        else:
+            raise TypeError("telemetry_stream_mode must be a string or a sequence of stream names")
+
         self._telemetry_publish_interval = max(0.0, float(telemetry_publish_interval))
         self._last_snapshot_time = 0.0
         self._snapshot_dirty = True
@@ -624,8 +673,16 @@ class DroneAPI:
 
     async def _start_telemetry_collector(self) -> None:
         if self._telemetry_collector is None:
-            self._telemetry_collector = TelemetryCollector(self.env.drone, self._handle_telemetry_update)
+            stream_names_arg = None if self._telemetry_auto_discover else self._telemetry_stream_names
+            self._telemetry_collector = TelemetryCollector(
+                self.env.drone,
+                self._handle_telemetry_update,
+                stream_names=stream_names_arg,
+                auto_discover=self._telemetry_auto_discover,
+            )
         try:
+            if self._telemetry_rate_hz > 0.0:
+                await self._telemetry_collector.configure_rates(self._telemetry_rate_hz)
             await self._telemetry_collector.start()
         except Exception as exc:
             print(f"[WARN] Telemetry collector failed to start: {exc}")
@@ -835,11 +892,10 @@ class DroneAPI:
                 print("-- Global position estimate OK")
                 break
 
-        await self._start_telemetry_collector()
-
         await self.env.turn_off_offboard()
         await self.env.arm()
         await self.env.takeoff_to_altitude(altitude=initial_altitude, yaw=yaw)
+        await self._start_telemetry_collector()
         self._current_yaw = float(yaw)
 
         if self.log_enabled:

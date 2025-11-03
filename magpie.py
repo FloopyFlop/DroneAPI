@@ -242,8 +242,30 @@ class TelemetryCollector:
         return sorted(names)
 
     async def configure_rates(self, rate_hz: float) -> None:
-        # Many rate setters are unsupported depending on vehicle type; we leave rates untouched by default.
-        return None
+        """
+        Configure telemetry rates. Many rate setters are unsupported depending on vehicle type.
+        We only set rates that are commonly supported to avoid errors.
+        """
+        if rate_hz <= 0.0:
+            return
+
+        telemetry_obj = self._system.telemetry
+        # Try to set the most critical rates, ignore errors for unsupported ones
+        rate_setters = [
+            "set_rate_position",
+            "set_rate_velocity_ned",
+            "set_rate_position_velocity_ned",
+            "set_rate_attitude",
+        ]
+
+        for setter_name in rate_setters:
+            setter = getattr(telemetry_obj, setter_name, None)
+            if setter is not None and callable(setter):
+                try:
+                    await setter(rate_hz)
+                except Exception:
+                    # Silently ignore unsupported rate setters
+                    pass
 
     async def start(self) -> None:
         if self._running:
@@ -252,6 +274,7 @@ class TelemetryCollector:
         self._tasks.clear()
         self._generators.clear()
         self._active_streams.clear()
+        self._closed_streams.clear()
 
         telemetry_obj = self._system.telemetry
         for name in self._stream_names:
@@ -447,16 +470,20 @@ class MagpieEnv:
     # ---------- telemetry ----------
 
     async def _read_telemetry_once(self) -> Tuple[np.ndarray, np.ndarray]:
-        async for message in self.drone.telemetry.position_velocity_ned():
-            pos_ned = np.array(
-                [message.position.north_m, message.position.east_m, message.position.down_m],
-                dtype=float,
-            )
-            vel_ned = np.array(
-                [message.velocity.north_m_s, message.velocity.east_m_s, message.velocity.down_m_s],
-                dtype=float,
-            )
-            return pos_ned, vel_ned
+        try:
+            async for message in self.drone.telemetry.position_velocity_ned():
+                pos_ned = np.array(
+                    [message.position.north_m, message.position.east_m, message.position.down_m],
+                    dtype=float,
+                )
+                vel_ned = np.array(
+                    [message.velocity.north_m_s, message.velocity.east_m_s, message.velocity.down_m_s],
+                    dtype=float,
+                )
+                return pos_ned, vel_ned
+        except Exception as exc:
+            # If telemetry fails, return last known position/velocity to avoid crash
+            return np.array([0.0, 0.0, 0.0], dtype=float), np.array([0.0, 0.0, 0.0], dtype=float)
 
     async def update_state(self) -> None:
         pos_ned, vel_ned = await self._read_telemetry_once()
@@ -514,14 +541,22 @@ class MagpieEnv:
             await self.drone.offboard.stop()
         except OffboardError as error:
             print(f"Stopping offboard failed with: {error._result.result}")
+        except Exception as exc:
+            print(f"[WARN] Offboard stop raised {exc}")
 
     async def arm(self) -> None:
         print("-- Arming")
-        await self.drone.action.arm()
+        try:
+            await self.drone.action.arm()
+        except Exception as exc:
+            print(f"[WARN] Arm command raised {exc}")
 
     async def disarm(self) -> None:
         print("-- Disarming")
-        await self.drone.action.disarm()
+        try:
+            await self.drone.action.disarm()
+        except Exception as exc:
+            print(f"[WARN] Disarm command raised {exc}")
 
     async def takeoff_to_altitude(self, altitude: float, yaw: float = 0.0) -> None:
         await self.compute_offset()
@@ -635,6 +670,8 @@ class DroneAPI:
         self._mission_start = 0.0
         self.telemetry_log: List[Dict[str, np.ndarray]] = []
         self.goal_history: List[np.ndarray] = []
+        self._log_sample_interval = max(self.control_dt * 5.0, 0.5)
+        self._last_log_sample_time = 0.0
 
         self._setup_ros2_publisher()
         self._publish_state_snapshot(trigger="init", force=True)
@@ -701,6 +738,8 @@ class DroneAPI:
             return
         await self._telemetry_collector.stop()
         self._telemetry_streams_started = []
+        self._telemetry_collector = None
+        self._latest_telemetry.clear()
 
     def _on_env_state_update(self, position_xyz: np.ndarray, velocity_xyz: np.ndarray) -> None:
         data = {
@@ -1016,8 +1055,11 @@ class DroneAPI:
 
         # Prime logging (initial sample)
         if self.log_enabled:
-            self.telemetry_log.append(self._make_log_sample(target_local=target_local))
-            self._snapshot_dirty = True
+            now_time = time.time()
+            if now_time - self._last_log_sample_time >= self._log_sample_interval:
+                self.telemetry_log.append(self._make_log_sample(target_local=target_local))
+                self._snapshot_dirty = True
+                self._last_log_sample_time = now_time
 
         prev_pos = start_pos.copy()
         t0 = time.time()
@@ -1044,8 +1086,11 @@ class DroneAPI:
 
             # log a sample each tick
             if self.log_enabled:
-                self.telemetry_log.append(self._make_log_sample(target_local=target_local))
-                self._snapshot_dirty = True
+                now_time = time.time()
+                if now_time - self._last_log_sample_time >= self._log_sample_interval:
+                    self.telemetry_log.append(self._make_log_sample(target_local=target_local))
+                    self._snapshot_dirty = True
+                    self._last_log_sample_time = now_time
 
             # --------- robust completion guards ----------
             # 1) if I'm simply inside the sphere, count it as done
@@ -1089,6 +1134,7 @@ class DroneAPI:
         self.telemetry_log.clear()
         self.goal_history.clear()
         self._mission_start = time.time()
+        self._last_log_sample_time = self._mission_start
         self._publish_state_snapshot(trigger="start_logging", force=True)
 
     def end_logging(self) -> None:
@@ -1099,7 +1145,6 @@ class DroneAPI:
 
     def save_flight_plot(self, path: Optional[str] = None) -> Optional[str]:
         if not self.log_enabled or len(self.telemetry_log) < 2:
-            self.end_logging()
             return None
 
         path = path or self.log_path
@@ -1267,7 +1312,6 @@ class DroneAPI:
 
         plt.savefig(path, dpi=320, bbox_inches="tight", pad_inches=0.12)
         plt.close(fig)
-        self.end_logging()
 
         print(f"-- Saved flight log plot to {path}")
         self._publish_state_snapshot(trigger="save_flight_plot", extra={"path": path}, force=True)

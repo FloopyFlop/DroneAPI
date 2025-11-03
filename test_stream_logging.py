@@ -99,6 +99,7 @@ def _format_value(value: Any, precision: int = 3) -> str:
 def _render_dashboard(stdscr, listener: TelemetryListener) -> None:
     curses.curs_set(0)
     stdscr.nodelay(True)
+    last_snapshot_timestamp = 0.0
 
     while True:
         ch = stdscr.getch()
@@ -106,6 +107,14 @@ def _render_dashboard(stdscr, listener: TelemetryListener) -> None:
             break
 
         count, last_received, trigger, snapshot = listener.get_state()
+
+        # Only redraw if we have a new snapshot (reduces CPU usage)
+        current_timestamp = snapshot.get("timestamp", 0.0) if snapshot else 0.0
+        if current_timestamp == last_snapshot_timestamp and snapshot is not None:
+            time.sleep(0.02)  # Fast polling for new data
+            continue
+
+        last_snapshot_timestamp = current_timestamp
         stdscr.erase()
         height, width = stdscr.getmaxyx()
 
@@ -115,7 +124,7 @@ def _render_dashboard(stdscr, listener: TelemetryListener) -> None:
         age = (time.time() - last_received) if last_received else float("inf")
         status_line = (
             f"Messages: {count}  |  Last trigger: {trigger or '-'}  |  "
-            f"Age: {age:0.2f}s"
+            f"Age: {age:0.3f}s"
         )
         stdscr.addstr(2, 0, status_line[:width])
 
@@ -191,7 +200,7 @@ def _render_dashboard(stdscr, listener: TelemetryListener) -> None:
             row += 1
 
         stdscr.refresh()
-        time.sleep(0.1)
+        time.sleep(0.02)  # Fast refresh for smooth updates
 
 
 def main() -> None:

@@ -150,37 +150,43 @@ async def _async_main():
         ("Cubic", Cubic),
     ]
 
-    for name_interp, interp_cls in interps:
-        for name_scn, waypoints in scenarios:
-            print(f"\n=== Starting demo: interp={name_interp} scenario={name_scn} ===")
+    # Create a single drone instance for all tests to avoid connection reuse issues
+    ros_kwargs = {}
+    if STREAM_RAW:
+        ros_kwargs = {
+            "ros2_enabled": True,
+            "ros2_topic": STREAM_TOPIC,
+            "ros2_node_name": STREAM_NODE,
+            "ros2_qos_depth": STREAM_QOS_DEPTH,
+        }
+        if STREAM_TO_CONSOLE:
+            ros_kwargs["ros2_publisher_factory"] = console_factory
 
-            ros_kwargs = {}
-            if STREAM_RAW:
-                ros_kwargs = {
-                    "ros2_enabled": True,
-                    "ros2_topic": STREAM_TOPIC,
-                    "ros2_node_name": STREAM_NODE,
-                    "ros2_qos_depth": STREAM_QOS_DEPTH,
-                }
-                if STREAM_TO_CONSOLE:
-                    ros_kwargs["ros2_publisher_factory"] = console_factory
+    drone = DroneAPI(
+        system_address="udp://:14540",
+        default_interpolation=Linear,
+        control_rate_hz=20.0,  # Increased from 10 to handle faster telemetry
+        max_speed_m_s=1.5,
+        use_velocity_command=True,
+        log_enabled=True,
+        log_path=f"/media/sf_Testing/flight_log.png",
+        telemetry_stream_mode="essential",
+        telemetry_rate_hz=20.0,  # Set explicit rate to speed up telemetry
+        telemetry_publish_interval=0.05,  # Publish 20 times per second (fast updates for dashboard)
+        **ros_kwargs,
+    )
 
-            drone = DroneAPI(
-                system_address="udp://:14540",
-                default_interpolation=interp_cls,
-                control_rate_hz=10.0,
-                max_speed_m_s=1.5,
-                use_velocity_command=True,
-                log_enabled=True,
-                log_path=f"/media/sf_Testing/{name_interp}_{name_scn}.png",
-                telemetry_stream_mode="essential",
-                telemetry_rate_hz=0.0,
-                telemetry_publish_interval=1.0,
-                **ros_kwargs,
-            )
+    try:
+        # Start mission once at the beginning
+        await drone.begin_mission(initial_altitude=initial_altitude, yaw=0.0)
 
-            try:
-                await drone.begin_mission(initial_altitude=initial_altitude, yaw=0.0)
+        for name_interp, interp_cls in interps:
+            for name_scn, waypoints in scenarios:
+                print(f"\n=== Starting demo: interp={name_interp} scenario={name_scn} ===")
+
+                # Update log path and interpolation for this test
+                drone.log_path = f"/media/sf_Testing/{name_interp}_{name_scn}.png"
+                drone.default_interpolation_cls = interp_cls
 
                 try:
                     await _run_waypoints_with_timeout(
@@ -189,20 +195,43 @@ async def _async_main():
                 except TimeoutError as e:
                     print(f"[FAIL] {e}")
 
+                # Return to home position between tests
                 try:
                     await _run_waypoints_with_timeout(
                         drone,
-                        [(0.0, initial_altitude, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)],
+                        [(0.0, initial_altitude, 0.0, 0.0)],
                         Cubic,
                         segment_timeout=25.0,
                         threshold=0.15,
                     )
                 except TimeoutError as e:
-                    print(f"[FAIL] (return) {e}")
+                    print(f"[FAIL] (return to home) {e}")
 
-                await drone.end_mission()
-            finally:
-                await drone.shutdown()
+                # Save the plot for this test
+                if drone.log_enabled and len(drone.telemetry_log) >= 2:
+                    drone.save_flight_plot(drone.log_path)
+                    # Clear logs for next test but keep logging enabled
+                    drone.telemetry_log.clear()
+                    drone.goal_history.clear()
+
+                # Small pause between tests
+                await asyncio.sleep(1.0)
+
+        # Final return to ground
+        try:
+            await _run_waypoints_with_timeout(
+                drone,
+                [(0.0, 0.0, 0.0, 0.0)],
+                Cubic,
+                segment_timeout=25.0,
+                threshold=0.15,
+            )
+        except TimeoutError as e:
+            print(f"[FAIL] (final landing) {e}")
+
+        await drone.end_mission()
+    finally:
+        await drone.shutdown()
 
 
 def main() -> None:

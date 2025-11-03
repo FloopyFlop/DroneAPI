@@ -1,5 +1,6 @@
 # magpie.py
 import asyncio
+import inspect
 import json
 import threading
 import time
@@ -144,42 +145,41 @@ class TelemetryCollector:
     Subscribes to every available MAVSDK telemetry stream and forwards updates.
     """
 
-    # (alias, attribute_name)
-    CANDIDATE_STREAMS: Tuple[Tuple[str, str], ...] = (
-        ("position", "position"),
-        ("home", "home"),
-        ("position_velocity_ned", "position_velocity_ned"),
-        ("velocity_ned", "velocity_ned"),
-        ("ground_speed_ned", "ground_speed_ned"),
-        ("attitude_euler", "attitude_euler"),
-        ("attitude_quaternion", "attitude_quaternion"),
-        ("angular_velocity_body", "angular_velocity_body"),
-        ("linear_acceleration_body", "linear_acceleration_body"),
-        ("imu", "imu"),
-        ("scaled_imu", "scaled_imu"),
-        ("raw_imu", "raw_imu"),
-        ("magnetometer", "magnetometer"),
-        ("gps_info", "gps_info"),
-        ("gps_raw", "raw_gps"),
-        ("health", "health"),
-        ("health_all_ok", "health_all_ok"),
-        ("battery", "battery"),
-        ("flight_mode", "flight_mode"),
-        ("status_text", "status_text"),
-        ("unix_epoch_time", "unix_epoch_time"),
-        ("distance_sensor", "distance_sensor"),
-        ("landed_state", "landed_state"),
-        ("in_air", "in_air"),
-        ("odometry", "odometry"),
-        ("fixedwing_metrics", "fixedwing_metrics"),
-        ("actuator_control_target", "actuator_control_target"),
-        ("actuator_output_status", "actuator_output_status"),
-        ("rc_status", "rc_status"),
-        ("airspeed", "airspeed"),
-        ("heading", "heading"),
-        ("acceleration_ned", "acceleration_ned"),
-        ("camera_attitude_euler", "camera_attitude_euler"),
-        ("camera_attitude_quaternion", "camera_attitude_quaternion"),
+    DEFAULT_STREAM_NAMES: Tuple[str, ...] = (
+        "position",
+        "home",
+        "position_velocity_ned",
+        "velocity_ned",
+        "ground_speed_ned",
+        "attitude_euler",
+        "attitude_quaternion",
+        "angular_velocity_body",
+        "linear_acceleration_body",
+        "imu",
+        "scaled_imu",
+        "raw_imu",
+        "magnetometer",
+        "gps_info",
+        "raw_gps",
+        "health",
+        "health_all_ok",
+        "battery",
+        "flight_mode",
+        "status_text",
+        "unix_epoch_time",
+        "distance_sensor",
+        "landed_state",
+        "in_air",
+        "odometry",
+        "fixedwing_metrics",
+        "actuator_control_target",
+        "actuator_output_status",
+        "rc_status",
+        "airspeed",
+        "heading",
+        "acceleration_ned",
+        "camera_attitude_euler",
+        "camera_attitude_quaternion",
     )
 
     def __init__(self, system: System, on_stream_update: Callable[[str, Dict[str, Any]], None]):
@@ -189,10 +189,50 @@ class TelemetryCollector:
         self._generators: List[Any] = []
         self._running = False
         self._active_streams: List[str] = []
+        self._stream_names: List[str] = self._discover_stream_names()
 
     @property
     def active_streams(self) -> List[str]:
         return list(self._active_streams)
+
+    def _discover_stream_names(self) -> List[str]:
+        telemetry_obj = self._system.telemetry
+        names = set(self.DEFAULT_STREAM_NAMES)
+
+        for name in dir(telemetry_obj):
+            if name.startswith("_"):
+                continue
+            if name.startswith("set_rate"):
+                # rate setters require arguments; skip them
+                continue
+            attr = getattr(telemetry_obj, name, None)
+            if attr is None or not callable(attr):
+                continue
+            try:
+                sig = inspect.signature(attr)
+            except (TypeError, ValueError):
+                continue
+
+            required_params = []
+            for p in sig.parameters.values():
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                    if p.default is inspect._empty:
+                        required_params.append(p)
+                elif p.kind is inspect.Parameter.VAR_POSITIONAL:
+                    required_params.append(p)
+            if required_params:
+                continue
+
+            if inspect.iscoroutinefunction(attr) or inspect.isasyncgenfunction(attr):
+                names.add(name)
+                continue
+
+            return_hint = getattr(attr, "__annotations__", {}).get("return")
+            hint_text = getattr(return_hint, "__name__", "") if return_hint else ""
+            if return_hint and ("AsyncGenerator" in hint_text or "AsyncIterator" in hint_text):
+                names.add(name)
+
+        return sorted(names)
 
     async def start(self) -> None:
         if self._running:
@@ -202,8 +242,8 @@ class TelemetryCollector:
         self._generators.clear()
         self._active_streams.clear()
 
-        for alias, attr_name in self.CANDIDATE_STREAMS:
-            attr = getattr(self._system.telemetry, attr_name, None)
+        for name in self._stream_names:
+            attr = getattr(self._system.telemetry, name, None)
             if attr is None or not callable(attr):
                 continue
             try:
@@ -211,13 +251,16 @@ class TelemetryCollector:
             except TypeError:
                 continue
             except Exception as exc:
-                print(f"[WARN] Telemetry stream '{attr_name}' failed to start: {exc}")
+                print(f"[WARN] Telemetry stream '{name}' failed to start: {exc}")
                 continue
 
-            task = asyncio.create_task(self._consume_stream(alias, generator))
+            if not hasattr(generator, "__anext__") and not hasattr(generator, "__aiter__"):
+                continue
+
+            task = asyncio.create_task(self._consume_stream(name, generator))
             self._tasks.append(task)
             self._generators.append(generator)
-            self._active_streams.append(alias)
+            self._active_streams.append(name)
 
     async def stop(self) -> None:
         if not self._running:
@@ -666,6 +709,10 @@ class DroneAPI:
             {key: self._snapshot_value(val) for key, val in self.telemetry_log[-1].items()}
             if self.telemetry_log else None
         )
+        log_samples = [
+            {key: self._snapshot_value(val) for key, val in sample.items()}
+            for sample in self.telemetry_log
+        ]
 
         snapshot: Dict[str, Any] = {
             "timestamp": now,
@@ -695,6 +742,7 @@ class DroneAPI:
                 "log_path": self.log_path,
                 "buffer_length": len(self.telemetry_log),
                 "last_sample": last_sample,
+                "samples": log_samples,
             },
             "telemetry_raw": {
                 "streams_active": list(self._telemetry_streams_started),

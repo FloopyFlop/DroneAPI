@@ -168,8 +168,8 @@ async def _async_main():
         control_rate_hz=20.0,  # Increased from 10 to handle faster telemetry
         max_speed_m_s=1.5,
         use_velocity_command=True,
-        log_enabled=True,
-        log_path=f"/media/sf_Testing/flight_log.png",
+        log_enabled=False,  # Logging now handled by external test_stream_logging.py
+        log_path=None,  # Not used anymore
         telemetry_stream_mode="essential",
         telemetry_rate_hz=20.0,  # Set explicit rate to speed up telemetry
         telemetry_publish_interval=0.05,  # Publish 20 times per second (fast updates for dashboard)
@@ -184,8 +184,7 @@ async def _async_main():
             for name_scn, waypoints in scenarios:
                 print(f"\n=== Starting demo: interp={name_interp} scenario={name_scn} ===")
 
-                # Update log path and interpolation for this test
-                drone.log_path = f"/media/sf_Testing/{name_interp}_{name_scn}.png"
+                # Update interpolation for this test
                 drone.default_interpolation_cls = interp_cls
 
                 try:
@@ -207,14 +206,10 @@ async def _async_main():
                 except TimeoutError as e:
                     print(f"[FAIL] (return to home) {e}")
 
-                # Save the plot for this test
-                if drone.log_enabled and len(drone.telemetry_log) >= 2:
-                    drone.save_flight_plot(drone.log_path)
-                    # Clear logs for next test but keep logging enabled
-                    drone.telemetry_log.clear()
-                    drone.goal_history.clear()
+                # Clear goal history for next test
+                drone.goal_history.clear()
 
-                # Small pause between tests
+                # Small pause between tests to allow external logger to catch up
                 await asyncio.sleep(1.0)
 
         # Final return to ground

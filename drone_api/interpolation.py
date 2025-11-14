@@ -480,3 +480,4 @@ class L1Guidance(BaseInterpolation):
         return InterpOutput(position_local=self._p1,
                             velocity_xyz_yaw=np.array([v_vec[0], v_vec[1], v_vec[2], yaw_rate], dtype=float),
                             done=False)
+

@@ -1104,3 +1104,4 @@ class DroneAPI:
         """
         print("[DEPRECATED] save_flight_plot() is deprecated. Use test_stream_logging.py for logging.")
         return None
+

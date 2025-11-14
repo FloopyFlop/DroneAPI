@@ -232,7 +232,7 @@ async def _async_main():
 def main() -> None:
     """
     ros2 entry points expect a synchronous callable.
-    Wrap the async mission execution in asyncio.run so ros2 run modular1 service works.
+    Wrap the async mission execution in asyncio.run so ros2 run drone_api service works.
     """
     asyncio.run(_async_main())
 
